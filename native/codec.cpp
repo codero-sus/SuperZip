@@ -40,14 +40,15 @@ struct Model {
   Prob is_match = kProbInit;
   Prob is_rep = kProbInit;
   Prob rep_sel[2] = {kProbInit, kProbInit}; // 0: rep0|rep12, 1: rep1|rep2
-  Prob len_unary[12];   // gamma of (len - 2), x in [1, 271]
+  Prob len_unary[10];             // gamma of (len - 2)
   Prob len_bits[10];
   Prob off_mode = kProbInit;      // 0: tiny (off 1-4), 1: slot+direct
   Prob tiny_unary[8];             // gamma of (off), x in [1, 4]
   Prob tiny_bits[8];
   Prob slot_unary[12];            // gamma of (n - 2), x in [1, 18]
   Prob slot_bits[10];
-  Prob off_direct[19];            // low n-1 bits of off-1
+  Prob off_direct[19];            // raw high bits of off-1
+  Prob off_align[16];             // 4-bit align tree for the low bits
 
   Model() {
     std::fill(std::begin(len_unary), std::end(len_unary), static_cast<Prob>(kProbInit));
@@ -57,9 +58,14 @@ struct Model {
     std::fill(std::begin(slot_unary), std::end(slot_unary), static_cast<Prob>(kProbInit));
     std::fill(std::begin(slot_bits), std::end(slot_bits), static_cast<Prob>(kProbInit));
     std::fill(std::begin(off_direct), std::end(off_direct), static_cast<Prob>(kProbInit));
+    std::fill(std::begin(off_align), std::end(off_align), static_cast<Prob>(kProbInit));
   }
 
 };
+
+#ifndef SZ_ALIGN
+#define SZ_ALIGN 1
+#endif
 
 // ------------------------------------------------------------- primitives --
 
@@ -102,8 +108,21 @@ void encode_offset(RcEncoder &rc, Model &m, uint32_t off) {
   uint32_t n = 0;
   while ((1u << n) <= u) ++n;
   encode_gamma(rc, m.slot_unary, m.slot_bits, n - 2);
-  for (uint32_t i = n - 1; i-- > 0;)
-    rc.encode_bit(m.off_direct[i], (u >> i) & 1u);
+  const uint32_t ncoded = n - 1;
+  const uint32_t ntree = ncoded < 4 ? ncoded : 4;
+  if (SZ_ALIGN) {
+    uint32_t idx = 1;
+    for (uint32_t t = ntree; t-- > 0;) {
+      const uint32_t bit = (u >> t) & 1u;
+      rc.encode_bit(m.off_align[idx], bit);
+      idx = (idx << 1) | bit;
+    }
+    for (uint32_t i = ncoded; i-- > ntree;)
+      rc.encode_bit(m.off_direct[i], (u >> i) & 1u);
+  } else {
+    for (uint32_t i = n - 1; i-- > 0;)
+      rc.encode_bit(m.off_direct[i], (u >> i) & 1u);
+  }
 }
 
 // ---- model-only training twins (no RC) for parse planning -----------------
@@ -175,8 +194,21 @@ static uint32_t price_offset_p(const Model &m, uint32_t off) {
   uint32_t n = 0;
   while ((1u << n) <= u) ++n;
   price += price_gamma_p(m.slot_unary, m.slot_bits, n - 2);
-  for (uint32_t i = n - 1; i-- > 0;)
-    price += price_bit(m.off_direct[i], (u >> i) & 1u);
+  const uint32_t ncoded = n - 1;
+  const uint32_t ntree = ncoded < 4 ? ncoded : 4;
+  if (SZ_ALIGN) {
+    uint32_t idx = 1;
+    for (uint32_t t = ntree; t-- > 0;) {
+      const uint32_t bit = (u >> t) & 1u;
+      price += price_bit(m.off_align[idx], bit);
+      idx = (idx << 1) | bit;
+    }
+    for (uint32_t i = ncoded; i-- > ntree;)
+      price += price_bit(m.off_direct[i], (u >> i) & 1u);
+  } else {
+    for (uint32_t i = n - 1; i-- > 0;)
+      price += price_bit(m.off_direct[i], (u >> i) & 1u);
+  }
   return price;
 }
 
@@ -210,8 +242,21 @@ int decode_offset(RcDecoder &rc, Model &m, uint32_t *out) {
   if (x < 1 || x > 18) return SZIP_ERR_CORRUPT;
   const uint32_t n = x + 2;
   uint32_t u = 1u << (n - 1);
-  for (uint32_t i = n - 1; i-- > 0;)
-    u |= rc.decode_bit(m.off_direct[i]) << i;
+  const uint32_t ncoded = n - 1;
+  const uint32_t ntree = ncoded < 4 ? ncoded : 4;
+  if (SZ_ALIGN) {
+    uint32_t idx = 1;
+    for (uint32_t t = ntree; t-- > 0;) {
+      const uint32_t bit = rc.decode_bit(m.off_align[idx]);
+      idx = (idx << 1) | bit;
+      u |= bit << t;
+    }
+    for (uint32_t i = ncoded; i-- > ntree;)
+      u |= rc.decode_bit(m.off_direct[i]) << i;
+  } else {
+    for (uint32_t i = n - 1; i-- > 0;)
+      u |= rc.decode_bit(m.off_direct[i]) << i;
+  }
   if (u + 1 > SZIP_MAX_OFFSET) return SZIP_ERR_CORRUPT;
   *out = u + 1;
   return SZIP_OK;
@@ -598,16 +643,19 @@ static void emit_plan(const uint8_t *src, uint32_t n,
 
 static void encode_one_mode(const uint8_t *src, uint32_t n, uint32_t mode,
                             std::vector<uint8_t> &out) {
-  std::vector<PlanTok> plan1, plan2, plan3;
+  std::vector<PlanTok> plan1, plan2, plan3, plan4;
   plan_block_pass(src, n, plan1, nullptr, mode);   // pass 1: online pricing
   plan_block_pass(src, n, plan2, &plan1, mode);    // pass 2: exact-along-plan
   plan_block_pass(src, n, plan3, &plan2, mode);    // pass 3: re-converged
-  std::vector<uint8_t> a, b, c;
+  plan_block_pass(src, n, plan4, &plan3, mode);    // pass 4: re-converged
+  std::vector<uint8_t> a, b, c, d;
   emit_plan(src, n, plan1, a, mode);
   emit_plan(src, n, plan2, b, mode);
   emit_plan(src, n, plan3, c, mode);
+  emit_plan(src, n, plan4, d, mode);
   out = (b.size() < a.size()) ? b : a;
-  if (c.size() < out.size()) out = c;              // keep the ACTUAL smallest
+  if (c.size() < out.size()) out = c;
+  if (d.size() < out.size()) out = d;              // keep the ACTUAL smallest
 }
 
 // v4 payload = 1 mode byte (0 = word-shape t5, 1 = gap order-1 t5) + RC stream.

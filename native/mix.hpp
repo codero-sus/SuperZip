@@ -19,11 +19,23 @@ constexpr int32_t kWShift = SZ_WSHIFT;
 #ifndef SZ_ERRSHIFT
 #define SZ_ERRSHIFT 18
 #endif
+#ifndef SZ_WSHIFT_B
+#define SZ_WSHIFT_B 13
+#endif
+#ifndef SZ_ERRSHIFT_B
+#define SZ_ERRSHIFT_B 20
+#endif
 #ifndef SZ_TREESHIFT
 #define SZ_TREESHIFT 5
 #endif
 constexpr int32_t kErrShift = SZ_ERRSHIFT;
 constexpr int32_t kTreeShift = SZ_TREESHIFT;
+#ifndef SZ_TREESHIFT_B
+#define SZ_TREESHIFT_B 4
+#endif
+#ifndef SZ_T5B
+#define SZ_T5B 1
+#endif
 #ifndef SZ_WCLAMP
 #define SZ_WCLAMP 20
 #endif
@@ -55,6 +67,12 @@ constexpr int32_t kWClamp = 1 << SZ_WCLAMP;
 #endif
 #ifndef SZ_T5GAP
 #define SZ_T5GAP 0
+#endif
+#ifndef SZ_O1GAP
+#define SZ_O1GAP 0
+#endif
+#ifndef SZ_GAPALL
+#define SZ_GAPALL 0
 #endif
 
 // Rolling history of the last 5 raw bytes (hist[0] = most recent).
@@ -98,8 +116,14 @@ struct MixLit {
   std::vector<Prob> t[6];
   int32_t w[kWCtx][6];
   uint32_t gap_mode = 0;
+  int32_t ts_ = SZ_TREESHIFT;
+  int32_t wsh_ = SZ_WSHIFT;
+  int32_t esh_ = SZ_ERRSHIFT;
 
   explicit MixLit(uint32_t mode = 0) : gap_mode(mode) {
+    ts_ = gap_mode ? SZ_TREESHIFT_B : SZ_TREESHIFT;
+    wsh_ = gap_mode ? SZ_WSHIFT_B : SZ_WSHIFT;
+    esh_ = gap_mode ? SZ_ERRSHIFT_B : SZ_ERRSHIFT;
     t[0].assign((SZ_STATE ? 96u : 32u) * 256, static_cast<Prob>(kProbInit));
     t[1].assign((SZ_O1EXACT ? 65536u : 8192u) * 256, static_cast<Prob>(kProbInit));
     t[2].assign((1u << SZ_O3BITS) * 256, static_cast<Prob>(kProbInit));
@@ -124,7 +148,10 @@ struct MixLit {
   static uint32_t h1(uint8_t a) { return (uint32_t)a >> 3; }
   static uint32_t h2(uint8_t a, uint8_t b, uint8_t wp, uint8_t mb, uint8_t st,
                      uint8_t bns) {
-    if (SZ_O1EXACT) return (((uint32_t)a << 8) | b); // 65536 exact contexts
+    if (SZ_O1EXACT) {
+      if (SZ_O1GAP) return (((uint32_t)a << 8) | bns); // gap order-1 (mode B)
+      return (((uint32_t)a << 8) | b);                  // 65536 exact contexts
+    }
     const bool use_mb = SZ_MB || (SZ_MB2 && st != 0);
     const uint32_t bb = SZ_BNS ? bns : b;
     return ((uint32_t)a * 2654435761u ^ (uint32_t)bb * 40503u ^
@@ -148,7 +175,10 @@ struct MixLit {
             (uint32_t)e * 2246822519u ^ (uint32_t)wp * 3266489917u) >> (32 - SZ_O5BITS);
   }
   uint32_t hw(const Hist &h, uint8_t mb) const {
-    if (SZ_T5GAP || gap_mode) return (((uint32_t)h.b[0] << 8) | h.bns); // gap order-1
+    if (SZ_T5GAP || gap_mode) {
+      if (SZ_T5B == 1) return (((uint32_t)h.b[0] << 8) | h.bns); // exact gap o1
+      return (((uint32_t)h.wpos << 13) | ((uint32_t)h.b[0] << 5) | ((uint32_t)h.bns >> 3)); // word-shape gap
+    }
     const uint32_t last = SZ_MBW ? mb : h.b[1];
     return (((uint32_t)h.wpos << 13) | ((uint32_t)h.b[0] << 5) | (last >> 3));
   }
@@ -171,26 +201,26 @@ struct MixLit {
   void train(uint32_t wk, Prob *n0, Prob *n1, Prob *n2, Prob *n3, Prob *n4,
              Prob *n5, uint32_t bit, uint32_t p) {
     if (bit == 0) {
-      *n0 = (Prob)(*n0 + ((2048 - *n0) >> kTreeShift));
-      *n1 = (Prob)(*n1 + ((2048 - *n1) >> kTreeShift));
-      *n2 = (Prob)(*n2 + ((2048 - *n2) >> kTreeShift));
-      *n3 = (Prob)(*n3 + ((2048 - *n3) >> kTreeShift));
-      if (n4) *n4 = (Prob)(*n4 + ((2048 - *n4) >> kTreeShift));
-      *n5 = (Prob)(*n5 + ((2048 - *n5) >> kTreeShift));
+      *n0 = (Prob)(*n0 + ((2048 - *n0) >> ts_));
+      *n1 = (Prob)(*n1 + ((2048 - *n1) >> ts_));
+      *n2 = (Prob)(*n2 + ((2048 - *n2) >> ts_));
+      *n3 = (Prob)(*n3 + ((2048 - *n3) >> ts_));
+      if (n4) *n4 = (Prob)(*n4 + ((2048 - *n4) >> ts_));
+      *n5 = (Prob)(*n5 + ((2048 - *n5) >> ts_));
     } else {
-      *n0 = (Prob)(*n0 - (*n0 >> kTreeShift));
-      *n1 = (Prob)(*n1 - (*n1 >> kTreeShift));
-      *n2 = (Prob)(*n2 - (*n2 >> kTreeShift));
-      *n3 = (Prob)(*n3 - (*n3 >> kTreeShift));
-      if (n4) *n4 = (Prob)(*n4 - (*n4 >> kTreeShift));
-      *n5 = (Prob)(*n5 - (*n5 >> kTreeShift));
+      *n0 = (Prob)(*n0 - (*n0 >> ts_));
+      *n1 = (Prob)(*n1 - (*n1 >> ts_));
+      *n2 = (Prob)(*n2 - (*n2 >> ts_));
+      *n3 = (Prob)(*n3 - (*n3 >> ts_));
+      if (n4) *n4 = (Prob)(*n4 - (*n4 >> ts_));
+      *n5 = (Prob)(*n5 - (*n5 >> ts_));
     }
     const int32_t err = (int32_t)(bit == 0 ? 2048 - p : 0 - p);
     const int64_t xs[6] = {kStretch[*n0], kStretch[*n1], kStretch[*n2],
                            kStretch[*n3], n4 ? kStretch[*n4] : 0,
                            kStretch[*n5]};
     for (int i = 0; i < 6; ++i) {
-      int32_t nw = w[wk][i] + (int32_t)((err * xs[i]) >> kErrShift);
+      int32_t nw = w[wk][i] + (int32_t)((err * xs[i]) >> esh_);
       if (nw > kWClamp) nw = kWClamp;
       if (nw < -kWClamp) nw = -kWClamp;
       w[wk][i] = nw;
