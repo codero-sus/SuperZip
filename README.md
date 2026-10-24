@@ -44,6 +44,11 @@ cargo test              # Rust engine unit tests + C++ engine via FFI
 `tests/crosscheck.sh` proves all three engines round-trip each other's
 archives **and produce byte-identical output**.
 
+Both parseers run in parallel and share match-finder / literal-price caches
+(encode is ~3× faster on code, ~5× on text than the first v4 build at the same
+compressed sizes). Pre-release binaries for Linux, macOS and Windows are built
+by `.github/workflows/release.yml` when a `v4.0.0-pre*` tag is pushed.
+
 ## Usage
 
 ```sh
