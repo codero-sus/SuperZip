@@ -53,6 +53,9 @@ constexpr int32_t kWClamp = 1 << SZ_WCLAMP;
 #ifndef SZ_BNS
 #define SZ_BNS 0
 #endif
+#ifndef SZ_T5GAP
+#define SZ_T5GAP 0
+#endif
 
 // Rolling history of the last 5 raw bytes (hist[0] = most recent).
 struct Hist {
@@ -94,8 +97,9 @@ constexpr uint32_t kWCtx = SZ_WSTATE ? 256u : (uint32_t)SZ_WCTX;
 struct MixLit {
   std::vector<Prob> t[6];
   int32_t w[kWCtx][6];
+  uint32_t gap_mode = 0;
 
-  MixLit() {
+  explicit MixLit(uint32_t mode = 0) : gap_mode(mode) {
     t[0].assign((SZ_STATE ? 96u : 32u) * 256, static_cast<Prob>(kProbInit));
     t[1].assign((SZ_O1EXACT ? 65536u : 8192u) * 256, static_cast<Prob>(kProbInit));
     t[2].assign((1u << SZ_O3BITS) * 256, static_cast<Prob>(kProbInit));
@@ -143,7 +147,8 @@ struct MixLit {
             (uint32_t)c * 805459861u ^ (uint32_t)d * 1013904223u ^
             (uint32_t)e * 2246822519u ^ (uint32_t)wp * 3266489917u) >> (32 - SZ_O5BITS);
   }
-  static uint32_t hw(const Hist &h, uint8_t mb) {
+  uint32_t hw(const Hist &h, uint8_t mb) const {
+    if (SZ_T5GAP || gap_mode) return (((uint32_t)h.b[0] << 8) | h.bns); // gap order-1
     const uint32_t last = SZ_MBW ? mb : h.b[1];
     return (((uint32_t)h.wpos << 13) | ((uint32_t)h.b[0] << 5) | (last >> 3));
   }

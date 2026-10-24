@@ -311,7 +311,7 @@ static void collect_lens(uint32_t max_len, std::vector<uint32_t> &lens) {
 // token history (matching the emit walk's training), instead of the noisy
 // leading-arrival heuristic. Returns the plan via `plan`.
 void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
-                     const std::vector<PlanTok> *guide) {
+                     const std::vector<PlanTok> *guide, uint32_t mode) {
   plan.clear();
   plan_cost_estimate = 0;
   if (n == 0) return;
@@ -344,7 +344,7 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
   MatchFinder mf;
   mf.prepare(n);
   std::vector<uint8_t> inserted(n, 0);
-  MixLit mix;               // live literal prices (raw-prefix function)
+  MixLit mix(mode);         // live literal prices (raw-prefix function)
   Hist hist;
 
   std::vector<DPNode> pool;
@@ -521,11 +521,11 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
 
 static void emit_plan(const uint8_t *src, uint32_t n,
                       const std::vector<PlanTok> &plan,
-                      std::vector<uint8_t> &out) {
+                      std::vector<uint8_t> &out, uint32_t mode) {
   (void)n;
   RcEncoder rc(out);
   Model m;
-  MixLit mix;
+  MixLit mix(mode);
   Hist hist;
   uint32_t pos = 0;
   uint32_t reps[3] = {0, 0, 0};
@@ -586,7 +586,9 @@ static void emit_plan(const uint8_t *src, uint32_t n,
   fprintf(stderr, "[stats] enc_price_sum=%.0f\n", g_enc_price_sum);
   fprintf(stderr, "[stats] dp_est=%.0f actual=%llu (1/16 bits)\n",
           dp_est, (unsigned long long)rc.bits * 16);
-  fprintf(stderr, "[stats] lit=%llu rep0=%llu(%lluB) rep1=%llu rep2=%llu norm=%llu(%lluB)\n",
+  fprintf(stderr, "[stats] nhist:");
+  for (int i = 0; i < 32; ++i) fprintf(stderr, " %d:%llu", i, (unsigned long long)st_nhist[i]);
+  fprintf(stderr, "\n[stats] lit=%llu rep0=%llu(%lluB) rep1=%llu rep2=%llu norm=%llu(%lluB)\n",
           (unsigned long long)st_lit,
           (unsigned long long)st_rep[0], (unsigned long long)st_repb,
           (unsigned long long)st_rep[1], (unsigned long long)st_rep[2],
@@ -594,27 +596,45 @@ static void emit_plan(const uint8_t *src, uint32_t n,
 #endif
 }
 
+static void encode_one_mode(const uint8_t *src, uint32_t n, uint32_t mode,
+                            std::vector<uint8_t> &out) {
+  std::vector<PlanTok> plan1, plan2, plan3;
+  plan_block_pass(src, n, plan1, nullptr, mode);   // pass 1: online pricing
+  plan_block_pass(src, n, plan2, &plan1, mode);    // pass 2: exact-along-plan
+  plan_block_pass(src, n, plan3, &plan2, mode);    // pass 3: re-converged
+  std::vector<uint8_t> a, b, c;
+  emit_plan(src, n, plan1, a, mode);
+  emit_plan(src, n, plan2, b, mode);
+  emit_plan(src, n, plan3, c, mode);
+  out = (b.size() < a.size()) ? b : a;
+  if (c.size() < out.size()) out = c;              // keep the ACTUAL smallest
+}
+
+// v4 payload = 1 mode byte (0 = word-shape t5, 1 = gap order-1 t5) + RC stream.
+// Both modes are coded; the actual smaller one ships (per-block self-tuning).
 void encode_block_szlzrc(const uint8_t *src, uint32_t n,
                          std::vector<uint8_t> &out) {
   out.clear();
   if (n == 0) return;
-  std::vector<PlanTok> plan1, plan2;
-  plan_block_pass(src, n, plan1, nullptr);      // pass 1: noisy online pricing
-  plan_block_pass(src, n, plan2, &plan1);       // pass 2: exact-along-plan pricing
   std::vector<uint8_t> a, b;
-  emit_plan(src, n, plan1, a);
-  emit_plan(src, n, plan2, b);
-  out = (b.size() < a.size()) ? b : a;          // keep the ACTUAL smaller one
+  encode_one_mode(src, n, 0, a);
+  encode_one_mode(src, n, 1, b);
+  const bool gap = b.size() < a.size();
+  out.push_back(gap ? 1 : 0);
+  const std::vector<uint8_t> &pick = gap ? b : a;
+  out.insert(out.end(), pick.begin(), pick.end());
 }
 
 int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
                         uint32_t n) {
-  if (src_len < 5) return SZIP_ERR_TRUNCATED;
-  RcDecoder rc(src, src_len);
+  if (src_len < 6) return SZIP_ERR_TRUNCATED;
+  const uint32_t mode = src[0];
+  if (mode > 1) return SZIP_ERR_CORRUPT;
+  RcDecoder rc(src + 1, src_len - 1);
   if (!rc.init()) return SZIP_ERR_TRUNCATED;
 
   Model m;
-  MixLit mix;
+  MixLit mix(mode);
   Hist hist;
   uint32_t out_pos = 0;
   uint32_t reps[3] = {0, 0, 0};
@@ -677,7 +697,7 @@ int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
     if (!rc.ok()) return SZIP_ERR_TRUNCATED;
   }
   if (!rc.ok()) return SZIP_ERR_TRUNCATED;
-  if (rc.pos() != src_len) return SZIP_ERR_CORRUPT;
+  if (rc.pos() != src_len - 1) return SZIP_ERR_CORRUPT;
   return SZIP_OK;
 }
 

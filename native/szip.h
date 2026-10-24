@@ -22,7 +22,7 @@ extern "C" {
 #define SZIP_ERR_BUFFER (-7)
 
 /* Container constants. */
-#define SZIP_VERSION 3
+#define SZIP_VERSION 4
 #define SZIP_MAGIC0 0x53 /* 'S' */
 #define SZIP_MAGIC1 0x5A /* 'Z' */
 #define SZIP_MAGIC2 0x50 /* 'P' */
