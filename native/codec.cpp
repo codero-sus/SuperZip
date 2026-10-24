@@ -286,13 +286,16 @@ struct DPNode {
 #ifndef SZ_DP_NO_NORM
 #define SZ_DP_NO_NORM 0
 #endif
-constexpr uint32_t kDPBeam = 4;
+constexpr uint32_t kDPBeam = 8;
 double plan_cost_estimate = 0;
 
 // lengths whose tokens are evaluated as match edges
+#ifndef SZ_ALLLEN
+#define SZ_ALLLEN 1
+#endif
 static void collect_lens(uint32_t max_len, std::vector<uint32_t> &lens) {
   lens.clear();
-  if (max_len <= 40) {
+  if (SZ_ALLLEN || max_len <= 40) {
     for (uint32_t l = kMinMatch; l <= max_len; ++l) lens.push_back(l);
     return;
   }
@@ -304,10 +307,38 @@ static void collect_lens(uint32_t max_len, std::vector<uint32_t> &lens) {
   lens.push_back(max_len);
 }
 
-void plan_block(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan) {
+// guide != nullptr: calibrate the price model EXACTLY along the guide plan's
+// token history (matching the emit walk's training), instead of the noisy
+// leading-arrival heuristic. Returns the plan via `plan`.
+void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
+                     const std::vector<PlanTok> *guide) {
   plan.clear();
   plan_cost_estimate = 0;
   if (n == 0) return;
+
+  // precompute guide token boundaries: gin[pos] = guide token ending at pos
+  std::vector<int32_t> gin;
+  std::vector<uint32_t> greps0;
+  if (guide) {
+    gin.assign(n + 1, -1);
+    greps0.assign(n + 1, 0);
+    uint32_t reps[3] = {0, 0, 0};
+    uint32_t pos = 0;
+    for (uint32_t i = 0; i < guide->size(); ++i) {
+      const PlanTok &t = (*guide)[i];
+      if (t.len == 0) {
+        gin[pos + 1] = (int32_t)i;
+        greps0[pos + 1] = reps[0];
+        pos += 1;
+      } else {
+        if (t.rep_idx != UINT32_MAX) reps_after_rep(reps, t.rep_idx);
+        else reps_after_normal(reps, t.off);
+        gin[pos + t.len] = (int32_t)i;
+        greps0[pos + t.len] = reps[0];
+        pos += t.len;
+      }
+    }
+  }
 
   Model ms;                 // online-calibrated price model
   MatchFinder mf;
@@ -373,32 +404,47 @@ void plan_block(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan) {
     if (best[pos].empty()) continue;
     ensure(pos);
 
-    // calibrate the price model on the token of the leading arrival at pos
-    {
+    // calibrate the price model
+    uint8_t mb = 0;
+    uint8_t st = 0;
+    if (guide) {
+      if (gin[pos] >= 0) {
+        const PlanTok &g = (*guide)[(uint32_t)gin[pos]];
+        if (g.len == 0) { bit_train(ms.is_match, 0); st = 0; }
+        else if (g.rep_idx != UINT32_MAX) { train_rep_token(ms, g.rep_idx, g.len); st = 1; }
+        else { train_norm_token(ms, g.off, g.len); st = 2; }
+      }
+      mb = (uint8_t)((pos >= greps0[pos]) ? src[pos - greps0[pos]] : 0);
+    } else {
       uint32_t lead = best[pos][0];
       for (uint32_t idx : best[pos])
         if (pool[idx].cost < pool[lead].cost) lead = idx;
       const DPNode &L = pool[lead];
       if (L.prev != UINT32_MAX) {
-        if (L.len == 0) bit_train(ms.is_match, 0);
-        else if (L.rep_idx != UINT32_MAX) train_rep_token(ms, L.rep_idx, L.len);
-        else train_norm_token(ms, L.off, L.len);
+        if (L.len == 0) { bit_train(ms.is_match, 0); st = 0; }
+        else if (L.rep_idx != UINT32_MAX) { train_rep_token(ms, L.rep_idx, L.len); st = 1; }
+        else { train_norm_token(ms, L.off, L.len); st = 2; }
       }
+      mb = (uint8_t)((pos >= L.reps[0]) ? src[pos - L.reps[0]] : 0);
     }
 
-    const uint32_t litp = mix.peek(hist, src[pos]); // exact, 1/16-bit units
+    const uint32_t litp = mix.peek(hist, src[pos], mb, st);
 #if SZ_STATS
     plan_cost_estimate += (double)litp; // debug: sum of literal prices
 #endif
-    const Match nm = mf.find(src, n, pos);
+#ifndef SZ_MCAND
+#define SZ_MCAND 8
+#endif
+    Match cands[8];
+    const uint32_t ncand = SZ_DP_NO_NORM ? 0u : mf.find_multi(src, n, pos, cands, SZ_MCAND);
 
     for (uint32_t idx : best[pos]) {
       const DPNode A = pool[idx]; // copy: try_insert may realloc pool
 
-      // literal edge
+      // literal edge (guided pass prices the is_match=0 bit too: exact there)
       {
         DPNode nd = A;
-        nd.cost = A.cost + litp;
+        nd.cost = A.cost + litp + (guide ? price_bit(ms.is_match, 0) : 0u);
         nd.prev = idx;
         nd.len = 0;
         nd.off = 0;
@@ -424,19 +470,13 @@ void plan_block(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan) {
         }
       }
 
-      // normal-match edges (same candidate for every arrival here)
-      if (!SZ_DP_NO_NORM && nm.len >= kMinMatch) {
+      // normal-match edges: every candidate distance, priced exactly
+      for (uint32_t ci = 0; ci < ncand; ++ci) {
+        const Match &nm = cands[ci];
         collect_lens(nm.len, lens);
         for (uint32_t l : lens) {
           DPNode nd = A;
           nd.cost = A.cost + price_norm_token(ms, nm.off, l);
-#if SZ_STATS
-          { static int printed = 0; if (printed < 12 && l == nm.len) {
-            fprintf(stderr, "[dbg] dp pos=%u off=%u len=%u est=%u is_match_p=%u litp=%u\n",
-                    pos, nm.off, l, price_norm_token(ms, nm.off, l),
-                    (uint32_t)ms.is_match, litp);
-            ++printed; } }
-#endif
           nd.prev = idx;
           nd.len = l;
           nd.off = nm.off;
@@ -448,7 +488,7 @@ void plan_block(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan) {
     }
 
     // advance the raw-prefix model after pricing this position
-    mix.train_byte(hist, src[pos]);
+    mix.train_byte(hist, src[pos], mb, st);
   }
 
   // reconstruct the cheapest full-coverage path
@@ -479,18 +519,17 @@ void plan_block(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan) {
   plan_cost_estimate = (double)pool[lead].cost;
 }
 
-void encode_block_szlzrc(const uint8_t *src, uint32_t n,
-                         std::vector<uint8_t> &out) {
-  out.clear();
-  std::vector<PlanTok> plan;
-  plan_block(src, n, plan);
-
+static void emit_plan(const uint8_t *src, uint32_t n,
+                      const std::vector<PlanTok> &plan,
+                      std::vector<uint8_t> &out) {
+  (void)n;
   RcEncoder rc(out);
   Model m;
   MixLit mix;
   Hist hist;
   uint32_t pos = 0;
   uint32_t reps[3] = {0, 0, 0};
+  uint8_t st = 0;
   double dp_est = plan_cost_estimate; (void)dp_est;
 
   for (const PlanTok &tok : plan) {
@@ -499,7 +538,11 @@ void encode_block_szlzrc(const uint8_t *src, uint32_t n,
       ++st_lit; ++st_bytes;
 #endif
       rc.encode_bit(m.is_match, 0);
-      mix.encode(rc, hist, src[pos]);
+      {
+        const uint8_t mb = (uint8_t)((pos >= reps[0]) ? src[pos - reps[0]] : 0);
+        mix.encode(rc, hist, src[pos], mb, st);
+      }
+      st = 0;
       ++pos;
     } else if (tok.rep_idx != UINT32_MAX) {
 #if SZ_STATS
@@ -511,7 +554,11 @@ void encode_block_szlzrc(const uint8_t *src, uint32_t n,
       if (tok.rep_idx != 0) rc.encode_bit(m.rep_sel[1], tok.rep_idx == 1 ? 0u : 1u);
       encode_gamma(rc, m.len_unary, m.len_bits, tok.len - 2);
       reps_after_rep(reps, tok.rep_idx);
-      for (uint32_t i = pos; i < pos + tok.len; ++i) mix.train_byte(hist, src[i]);
+      st = 1;
+      for (uint32_t i = pos; i < pos + tok.len; ++i) {
+        const uint8_t mb = (uint8_t)((i >= reps[0]) ? src[i - reps[0]] : 0);
+        mix.train_byte(hist, src[i], mb, st);
+      }
       pos += tok.len;
     } else {
 #if SZ_STATS
@@ -526,7 +573,11 @@ void encode_block_szlzrc(const uint8_t *src, uint32_t n,
       encode_offset(rc, m, tok.off);
       encode_gamma(rc, m.len_unary, m.len_bits, tok.len - 2);
       reps_after_normal(reps, tok.off);
-      for (uint32_t i = pos; i < pos + tok.len; ++i) mix.train_byte(hist, src[i]);
+      st = 2;
+      for (uint32_t i = pos; i < pos + tok.len; ++i) {
+        const uint8_t mb = (uint8_t)((i >= reps[0]) ? src[i - reps[0]] : 0);
+        mix.train_byte(hist, src[i], mb, st);
+      }
       pos += tok.len;
     }
   }
@@ -543,6 +594,19 @@ void encode_block_szlzrc(const uint8_t *src, uint32_t n,
 #endif
 }
 
+void encode_block_szlzrc(const uint8_t *src, uint32_t n,
+                         std::vector<uint8_t> &out) {
+  out.clear();
+  if (n == 0) return;
+  std::vector<PlanTok> plan1, plan2;
+  plan_block_pass(src, n, plan1, nullptr);      // pass 1: noisy online pricing
+  plan_block_pass(src, n, plan2, &plan1);       // pass 2: exact-along-plan pricing
+  std::vector<uint8_t> a, b;
+  emit_plan(src, n, plan1, a);
+  emit_plan(src, n, plan2, b);
+  out = (b.size() < a.size()) ? b : a;          // keep the ACTUAL smaller one
+}
+
 int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
                         uint32_t n) {
   if (src_len < 5) return SZIP_ERR_TRUNCATED;
@@ -554,11 +618,14 @@ int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
   Hist hist;
   uint32_t out_pos = 0;
   uint32_t reps[3] = {0, 0, 0};
+  uint8_t st = 0;
 
   while (out_pos < n) {
     if (rc.decode_bit(m.is_match) == 0) {
-      dst[out_pos] = mix.decode(rc, hist);
+      const uint8_t mb = (uint8_t)((out_pos >= reps[0]) ? dst[out_pos - reps[0]] : 0);
+      dst[out_pos] = mix.decode(rc, hist, mb, st);
       hist.push(dst[out_pos]);
+      st = 0;
       ++out_pos;
     } else if (rc.decode_bit(m.is_rep) == 1) {
       uint32_t idx = 0;
@@ -578,8 +645,11 @@ int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
       for (uint32_t i = 0; i < len; ++i)
         dst[out_pos + i] = dst[out_pos - off + i];
       reps_after_rep(reps, idx);
-      for (uint32_t i = 0; i < len; ++i)
-        mix.train_byte(hist, dst[out_pos + i]);
+      st = 1;
+      for (uint32_t i = 0; i < len; ++i) {
+        const uint8_t mb = (uint8_t)(((out_pos + i) >= reps[0]) ? dst[out_pos + i - reps[0]] : 0);
+        mix.train_byte(hist, dst[out_pos + i], mb, st);
+      }
       out_pos += len;
     } else {
       uint32_t off = 0;
@@ -597,8 +667,11 @@ int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
       for (uint32_t i = 0; i < len; ++i)
         dst[out_pos + i] = dst[out_pos - off + i];
       reps_after_normal(reps, off);
-      for (uint32_t i = 0; i < len; ++i)
-        mix.train_byte(hist, dst[out_pos + i]);
+      st = 2;
+      for (uint32_t i = 0; i < len; ++i) {
+        const uint8_t mb = (uint8_t)(((out_pos + i) >= reps[0]) ? dst[out_pos + i - reps[0]] : 0);
+        mix.train_byte(hist, dst[out_pos + i], mb, st);
+      }
       out_pos += len;
     }
     if (!rc.ok()) return SZIP_ERR_TRUNCATED;
