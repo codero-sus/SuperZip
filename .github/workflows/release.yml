@@ -111,19 +111,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set +e
-          which gh || echo "::error::gh CLI not on PATH"
-          gh --version 2>&1 | head -1
-          out=$(gh release view "${{ github.ref_name }}" 2>&1 >/dev/null)
-          if [ $? -eq 0 ]; then
-            gh release upload "${{ github.ref_name }}" dist/* --clobber 2>&1 | tee /tmp/e.txt
-            gh release edit "${{ github.ref_name }}" --prerelease --title "G0D SZIP ${{ github.ref_name }} (preview)" --notes-file notes.md 2>&1 | tee /tmp/e.txt
-          else
-            echo "no existing release ($out)"
-            gh release create "${{ github.ref_name }}" --prerelease \
-              --title "G0D SZIP ${{ github.ref_name }} (preview)" \
-              --notes-file notes.md dist/* 2>&1 | tee /tmp/e.txt
+          TAG="${{ github.ref_name }}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --prerelease \
+              --title "G0D SZIP $TAG (preview)" --notes-file notes.md
+            echo "::notice::gh release create rc=${PIPESTATUS[0]:-$?}"
           fi
-          rc=$?
-          echo "gh exit code: $rc"
-          tail -5 /tmp/e.txt | while IFS= read -r l; do echo "::error::gh: $l"; done
-          exit $rc
+          rc_create=$?
+          gh release view "$TAG" --json tagName -q .tagName 2>&1 | tee /tmp/v.txt
+          echo "::notice::release present: $(cat /tmp/v.txt)"
+          for f in dist/*; do
+            ok=0
+            for i in 1 2 3 4 5; do
+              gh release upload "$TAG" "$f" --clobber
+              if [ $? -eq 0 ]; then ok=1; break; fi
+              echo "::warning::upload $f attempt $i failed; retrying"
+              sleep 5
+            done
+            [ $ok -eq 0 ] && echo "::error::asset upload failed: $f"
+          done
+          gh release view "$TAG" --json assets -q '.assets[].name' 2>&1 | tee /tmp/a.txt
+          n=$(wc -l < /tmp/a.txt)
+          echo "::notice::assets on release: $n"
+          [ "$n" -ge 4 ] || { echo "::error::expected >=4 assets"; exit 1; }
