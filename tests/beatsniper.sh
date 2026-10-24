@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 CC=${CXX:-g++}
 mkdir -p build
 ./tests/mkcorpus.sh >/dev/null
-$CC -std=c++17 -O2 -Wall -Wextra -Wshadow -Wconversion -DNDEBUG -Inative \
+$CC -std=c++17 -O3 -Wall -Wextra -Wshadow -Wconversion -DNDEBUG -Inative \
     native/codec.cpp native/cli.cpp -o build/g0dszip -pthread
 
 # frozen sniper sizes (bytes) on the frozen corpora
