@@ -47,7 +47,7 @@ jobs:
         if: runner.os == 'Windows'
         with:
           msystem: MINGW64
-          install: mingw-w64-x86_64-gcc
+          install: mingw-w64-x86_64-gcc diffutils
           update: true
       - name: build (posix)
         if: runner.os != 'Windows'
@@ -63,7 +63,11 @@ jobs:
         shell: msys2 {0}
         run: |
           g++ -std=c++17 -O2 -Wall -Wextra -Wshadow -Wconversion -DNDEBUG \
-              -Inative native/codec.cpp native/cli.cpp -o ${{ matrix.asset }} -pthread
+              -Inative native/codec.cpp native/cli.cpp -o ${{ matrix.asset }} -pthread -static
+      - name: smoke (windows, mingw)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
           ./${{ matrix.asset }} c README.md smoke.szip
           ./${{ matrix.asset }} d smoke.szip smoke.out
           cmp README.md smoke.out
