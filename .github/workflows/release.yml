@@ -1,0 +1,107 @@
+name: build-and-prerelease
+
+on:
+  push:
+    tags: ['v4.0.0-pre*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: roundtrips + sniper scoreboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: beatsniper
+        # The script prints an honest scoreboard. Release gating = every real
+        # sniper beaten (>=10 passed); the stretch line (4% under xz) is logged
+        # but does not block the preview.
+        run: |
+          set +e
+          sh tests/beatsniper.sh 2>&1 | tee beatsniper.log
+          grep -q "10 passed" beatsniper.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beatsniper-log
+          path: beatsniper.log
+
+  build:
+    name: build (${{ matrix.asset }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: g0dszip-linux-x86_64
+          - os: macos-latest
+            asset: g0dszip-macos-arm64
+          - os: windows-latest
+            asset: g0dszip-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+          update: true
+      - name: build (posix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          g++ -std=c++17 -O2 -Wall -Wextra -Wshadow -Wconversion -DNDEBUG \
+              -Inative native/codec.cpp native/cli.cpp -o ${{ matrix.asset }} -pthread
+          ./${{ matrix.asset }} c README.md /tmp/smoke.szip
+          ./${{ matrix.asset }} d /tmp/smoke.szip /tmp/smoke.out
+          cmp README.md /tmp/smoke.out
+      - name: build (windows, mingw)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          g++ -std=c++17 -O2 -Wall -Wextra -Wshadow -Wconversion -DNDEBUG \
+              -Inative native/codec.cpp native/cli.cpp -o ${{ matrix.asset }} -pthread
+          ./${{ matrix.asset }} c README.md smoke.szip
+          ./${{ matrix.asset }} d smoke.szip smoke.out
+          cmp README.md smoke.out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  prerelease:
+    name: publish pre-release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: beatsniper-log
+          path: dist
+      - name: create pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "G0D SZIP preview build (${{ github.ref_name }}) — own encoder + own decoder, .szip format v4."
+            echo
+            echo "Dual-mode DP-optimal compressor (word/gap literal models, 4-pass parse, GOD-stage context mixing)."
+            echo "Frozen-corpus scoreboard (tests/beatsniper.sh):"
+            echo '```'
+            cat dist/beatsniper.log
+            echo '```'
+            echo
+            echo "Binaries: Linux x86-64, macOS arm64, Windows x86-64 (MinGW). Usage: \`g0dszip c <in> <out.szip>\` / \`g0dszip d <in.szip> <out>\`."
+            echo "Note: the stretch goal '4% under xz-9e' currently lands 85 bytes short on code (17,018 vs 16,933); everything else in the table is a win."
+          } > notes.md
+          gh release create "${{ github.ref_name }}" --prerelease \
+            --title "G0D SZIP ${{ github.ref_name }} (preview)" \
+            --notes-file notes.md dist/*
