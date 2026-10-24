@@ -1,4 +1,4 @@
-# G0D SZIP — `.szip` Container Format (v3)
+# G0D SZIP — `.szip` Container Format (v4)
 
 Reference project: **SuperZip / G0D SZIP**. This document is normative for the
 byte layout of `.szip` archives and the SZLZRC v3 bitstream.
@@ -43,7 +43,7 @@ bytes after the 4-byte prefix), payload (`comp_size` bytes).
 | type | codec |
 |------|-------|
 | 0    | stored (raw copy) |
-| 1    | SZLZRC v3 payload |
+| 1    | SZLZRC v4 payload: 1 mode byte (`0` = word mode, `1` = gap mode) then the RC stream |
 | other| reserved |
 
 Sum of block `raw_size` fields must equal the header `raw_size`.
@@ -55,9 +55,9 @@ Sum of block `raw_size` fields must equal the header `raw_size`.
 
 ---
 
-## 2. Block codec: SZLZRC v3 (`type = 1`)
+## 2. Block codec: SZLZRC v4 (`type = 1`)
 
-**S**uper**Z**ip **LZ**77 + **R**ange **C**oder + context mixing, v3.
+**S**uper**Z**ip **LZ**77 + **R**ange **C**oder + context mixing, v4.
 
 Pipeline: LZ77 factorization (hash chains, price-aware parse, 1 MiB window,
 last-3 rep offsets) → token stream → adaptive binary range coder (carryless,
@@ -103,7 +103,8 @@ adaptive probability (`unary[i]`, `bits[i]`).
 ### 2.3 Token stream
 
 Decoder state: history `hist` (last 5 raw bytes, all `0` initially, plus
-`wpos` = bytes since the last space byte `0x20`, clamped to `7`, init `0`),
+`wpos` = bytes since the last whitespace byte (`0x20/0x09/0x0A/0x0D`),
+clamped to `7`, init `0`; `bns` = last non-whitespace byte, init `0`),
 `rep0,rep1,rep2` (1-based offsets, `0` = none), all zero initially.
 
 ```
@@ -127,14 +128,17 @@ repeat until raw_size bytes are produced:
 ```
 
 `push(hist, b)`: `hist.b[4..1] = hist.b[3..0]; hist.b[0] = b;` then
-`wpos = (b == 32) ? 0 : min(wpos + 1, 7)`.
+`wpos = ws(b) ? 0 : min(wpos + 1, 7)` where `ws(b)` is `b` in
+`{0x20, 0x09, 0x0A, 0x0D}`; `if !ws(b): bns = b`.
 
 **Offset code** (`u = off - 1`, `n = bitlen(u)`):
 
 - `u < 4` (off 1..4): `off_mode = 0`, then `gamma(off)`
-- else: `off_mode = 1`, then `gamma(n - 2)`, then `n - 1` mantissa bits of `u`
-  (bit `i` coded with `off_direct[i]`, `i` from `n-2` down to `0`; the top bit
-  of `u` is implicitly `1`)
+- else: `off_mode = 1`, then `gamma(n - 2)`, then the `n - 1` mantissa bits
+  of `u` (top bit of `u` implicitly `1`): the low `min(n-1, 4)` bits are
+  coded through the 4-bit **align tree** `off_align` (binary tree, node `idx`
+  starts at `1`, `idx = 2*idx + bit`), the remaining high bits with
+  `off_direct[i]` (bit `i`, `i` from `n-2` down to `ntree`)
 
 `off` must decode to `[1, 2^20]`.
 
@@ -151,27 +155,35 @@ an arithmetic shift.
   -45056, 45056)` for `p` in 1..2047, `STRETCH[0] = -45056`.
 - `SQUASH[5633]` (i16): `SQUASH[i] = clamp(round(2048 / (1 + 2^(-x/4096))),
   1, 2047)` with `x = i*16 - 45056`.
-- `BIT_PRICE[2049]` (u16): `BIT_PRICE[p] = clamp(round(-log2(p/2048) * 16),
-  1, 2048)` (1/16-bit units; encoder-only).
+- `BIT_PRICE[2049]` (u16): `BIT_PRICE[p] = clamp(round(-log2(p/2048) * 256),
+  1, 5120)` (1/256-bit units; encoder-only).
 
 **Model state**: six binary trees `t0..t5`, each `num_ctx × 256` u16 nodes
 indexed `[ctx * 256 + sym]`, `sym` in 1..255 during the walk (leaf `sym = 0`
-is never indexed). All nodes init `1024`.
+is never indexed). All nodes init `1024`. Mixer weights `w[64][6]` init
+`(1<<13)/6`, clamp `±2^20`.
 
-Contexts at literal time (`b0..b4 = hist.b[0..4]`, `wp = wpos`):
+Contexts at literal time (`b0..b4 = hist.b[0..4]`, `wp = wpos`, `bn = bns`;
+`mode` is the block mode byte):
 
 ```
 c0 = b0 >> 3                                             (32 ctx)
-c1 = (b0*2654435761 ^ b1*40503 ^ wp*2246822519) >> 19     (8192 ctx)
-c2 = (b0*2654435761 ^ b1*40503 ^ b2*805459861 ^ wp*2246822519) >> 15
-c3 = (b0*2654435761 ^ b1*40503 ^ b2*805459861 ^ b3*1013904223 ^ wp*2246822519) >> 15
+c1 = (b0 << 8) | b1                                      (65536 exact)
+c2 = (b0*2654435761 ^ b1*40503 ^ b2*805459861 ^ wp*2246822519) >> 14
+c3 = (b0*2654435761 ^ b1*40503 ^ b2*805459861 ^ b3*1013904223 ^ wp*2246822519) >> 14
 c4 = (b0*2654435761 ^ b1*40503 ^ b2*805459861 ^ b3*1013904223
-      ^ b4*2246822519 ^ wp*3266489917) >> 15               (131072 ctx)
-c5 = (wp << 13) | (b0 << 5) | (b1 >> 3)                   (65536 ctx)
+      ^ b4*2246822519 ^ wp*3266489917) >> 14               (262144 ctx)
+c5 = mode ? ((b0 << 8) | bn) : ((wp << 13) | (b0 << 5) | (b1 >> 3))   (65536)
 ```
 
-Tree sizes: `t0` 32, `t1` 8192, `t2` 131072, `t3` 131072, `t4` 131072,
+Tree sizes: `t0` 32, `t1` 65536, `t2` 262144, `t3` 262144, `t4` 262144,
 `t5` 65536 contexts.
+
+**Per-mode rates**: tree nodes update `p += (2048-p)>>5` / `p -= p>>5` in
+mode `0`, `>>4` in mode `1`. Mixer weight error shift: `>>18` in mode `0`,
+`>>20` in mode `1`. Weight scale `>>13` both. (The encoder encodes each
+block in both modes and stores the smaller; the mode byte selects which the
+decoder applies.)
 
 **Mixer**: weights `w[64][6]` (i32), all init `1365` (= `2^13 / 6`, equal
 mix). Weight context `wk = bitpos + 8 * (b0 >> 5)` where `bitpos` counts the
@@ -204,23 +216,24 @@ not push `hist` (the caller does). Encoder and decoder must call
 ### 2.5 Encoder parse (advice; decoder-agnostic)
 
 The parse policy is **not** part of the bitstream contract — any factorization
-respecting the grammar decodes correctly. The shipped encoders use
-**dynamic-programming optimal parse** per block:
+respecting the grammar decodes correctly. The shipped encoder uses
+**dynamic-programming optimal parse** per block and mode:
 
 - Match finder: 3-byte hash (`v * 2654435761 >> 14`), 18-bit table, hash
-  chains, window `2^20`, chain depth `400`, max match `2048`.
-- Per position, three edge kinds are offered: a literal; any of the three
-  rep0-2 families (length 3..rep_maxlen); a normal match (lengths 3..max
-  plus the encoder's length-candidate set).
-- Edge prices are **exact**: the true coded cost of that token under the
-  current adaptive models (`price_bit` at the model's live probability),
-  in 1/256-bit units (`§2.6` price table). Literal edges use the mixer's
-  shadow price of the byte in context (trained bit by bit while pricing,
-  state restored afterwards); token edges include the trailing unary-1 bit
-  of the length gamma field.
-- The cheapest path through the block (beam width 4, arrivals deduplicated
-  by rep state) is then encoded; the models train on the chosen tokens.
-  The decoder cannot observe which parse produced a stream.
+  chains, window `2^20`, chain depth `400`, max match `2048`; up to 8
+  distinct-distance candidates per position (top by score, plus longest and
+  nearest).
+- Per position, three edge kinds: a literal; any rep0-2 family (length
+  3..rep_maxlen); normal matches (full length sets 3..max_len at each
+  candidate distance).
+- Edge prices are exact (the models' live coded costs, `BIT_PRICE` at
+  1/256-bit units; literal edges use the mixer's shadow price, trained bit by
+  bit while pricing and restored afterwards).
+- Four planning passes run per mode (beam width 8); each pass after the
+  first calibrates the price model along the previous plan's exact token
+  history. Every candidate plan is encoded and the ACTUAL smaller payload
+  ships. Both modes (mode byte `0`/`1`) are encoded per block and the smaller
+  payload ships there too. The decoder cannot observe any of this.
 
 ### 2.6 Stored blocks (`type = 0`)
 
@@ -241,5 +254,7 @@ footer CRC mismatch. A corrupted archive must never cause out-of-bounds access.
 gamma offsets). `version = 2` used SZLZRC v2 (rep offsets + price-aware
 parse + order-1 literal trees). Both are rejected by the version field.
 `version = 3` replaces literal coding with the §2.4 context mixer; token
-syntax is unchanged from v2. Future GOD stages get new block `type` IDs or a
-`version = 4` bump.
+syntax is unchanged from v2. `version = 4` (2026-10-24) changes the mixer
+(exact order-1, gap/word dual mode with per-mode rates, whitespace `wpos`),
+the offset code (align tree), and prefixes each coded payload with its mode
+byte. v1-v3 streams are rejected by the version field.

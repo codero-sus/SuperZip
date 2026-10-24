@@ -53,7 +53,7 @@ g0dszip t input.szip                         # verify (CRC32 + structure)
 g0dszip i input.szip                         # info
 ```
 
-## Codec: SZLZRC v3 ("GOD stage")
+## Codec: SZLZRC v4 ("GOD stage")
 
 **S**uper**Z**ip **LZ**77 + **R**ange **C**oder + integer context mixing —
 block-based (default 1 MiB), price-aware hash-chain matching (up to 2 KiB
@@ -70,22 +70,29 @@ never expands):
 
 | corpus | **G0D SZIP v3** | gzip-9 | bzip2-9 | xz-9e |
 |---|---|---|---|---|
-| source code (70,592 B) | **25.592%** (18,066 B) | 27.325% | 25.802% | **24.989%** |
-| word-salad text (500,003 B) | **10.637%** (53,184 B) | 17.309% | 10.791% | 15.353% |
+| source code (70,592 B) | **24.122%** (17,018 B) | 27.325% | 25.802% | 24.989% |
+| word-salad text (500,003 B) | **10.624%** (53,122 B) | 17.309% | 10.791% | 15.353% |
 | random (500,000 B) | **100.008%** (500,038 B) | 100.023% | 100.526% | 100.017% |
 
-**G0D SZIP beats both snipers on all three corpora except xz on source
-code** — and beats gzip everywhere. On source code bzip2-9 is now 148 bytes
-behind; xz-9e stays 426 bytes (2.4%) ahead there. Evolution: v2 scored
-26.3%/17.2% on the old corpora — the v3 mixer cut text by ~38% relative, and
-the v3 optimal parse took another 259 bytes off code vs the greedy parse.
+**G0D SZIP beats every sniper on all three corpora** — source code now
+included: 17,018 B vs xz-9e's 17,640 B (3.5% better) and bzip2-9's 18,214 B.
+On text it stays 770+ bytes ahead of bzip2. The strict goal of 4% under xz on
+code (16,933 B) is 85 bytes away; `tests/beatsniper.sh` runs the whole
+scoreboard with roundtrip checks and reports it. Evolution: v2 scored
+26.3%/17.2% on the old corpora — the v3 mixer cut text by ~38% relative; the
+v4 dual-mode optimal parse (four exact-calibrated DP passes, both model modes
+per block, smallest actual payload wins) took code from 25.8% to 24.1%.
 
 Benchmark corpora are frozen in `tests/corpus/` (`tests/mkcorpus.sh` copies
 them to `build/`) so these claims stay reproducible as the code evolves.
 The encoder parses each block by dynamic programming: every literal, rep, and
 match edge is priced exactly (the model's real coded cost, 1/256-bit
-resolution) and the cheapest tokenization wins — encoder-side only. The
-decoder is agnostic, and any compliant parse policy interoperates.
+resolution), four guided passes converge the plan, and every candidate is
+actually encoded — the smallest payload ships. Each block is encoded in both
+literal-model modes (word-shape for text, whitespace-gap for code) and the
+mode byte in the payload selects the winner. All of it is encoder-side; the
+decoder just follows the mode byte. Any compliant parse policy interoperates.
+`tests/beatsniper.sh` verifies roundtrips and the sniper scoreboard.
 
 ## Safety
 
