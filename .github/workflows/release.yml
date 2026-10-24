@@ -81,6 +81,9 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -130,7 +133,7 @@ jobs:
             done
             [ $ok -eq 0 ] && echo "::error::asset upload failed: $f"
           done
-          gh release view "$TAG" --json assets -q '.assets[].name' 2>&1 | tee /tmp/a.txt
-          n=$(wc -l < /tmp/a.txt)
+          gh release view "$TAG" --json assets -q '.assets[].name' 2>/dev/null | tee /tmp/a.txt
+          n=$(grep -c . /tmp/a.txt || true)
           echo "::notice::assets on release: $n"
           [ "$n" -ge 4 ] || { echo "::error::expected >=4 assets"; exit 1; }
