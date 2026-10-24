@@ -36,6 +36,9 @@ constexpr int32_t kTreeShift = SZ_TREESHIFT;
 #ifndef SZ_T5B
 #define SZ_T5B 1
 #endif
+#ifndef SZ_NO5_B
+#define SZ_NO5_B 0
+#endif
 #ifndef SZ_WCLAMP
 #define SZ_WCLAMP 20
 #endif
@@ -241,7 +244,7 @@ struct MixLit {
       const uint32_t bit = (b >> k) & 1;
       Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][c1 * 256 + sym];
       Prob *n2 = &t[2][c2 * 256 + sym], *n3 = &t[3][c3 * 256 + sym];
-      Prob *n4 = SZ_ORDER5 ? &t[4][c5 * 256 + sym] : nullptr;
+      Prob *n4 = (SZ_ORDER5 && !(gap_mode && SZ_NO5_B)) ? &t[4][c5 * 256 + sym] : nullptr;
       Prob *n5 = &t[5][cw * 256 + sym];
       const uint32_t wk = wctx((uint32_t)(7 - k), h, st);
       const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5);
@@ -263,7 +266,7 @@ struct MixLit {
       const uint32_t bit = (b >> k) & 1;
       Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][c1 * 256 + sym];
       Prob *n2 = &t[2][c2 * 256 + sym], *n3 = &t[3][c3 * 256 + sym];
-      Prob *n4 = SZ_ORDER5 ? &t[4][c5 * 256 + sym] : nullptr;
+      Prob *n4 = (SZ_ORDER5 && !(gap_mode && SZ_NO5_B)) ? &t[4][c5 * 256 + sym] : nullptr;
       Prob *n5 = &t[5][cw * 256 + sym];
       const uint32_t wk = wctx((uint32_t)(7 - k), h, st);
       const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5);
@@ -288,7 +291,7 @@ struct MixLit {
     for (int k = 0; k < 8; ++k) {
       Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][c1 * 256 + sym];
       Prob *n2 = &t[2][c2 * 256 + sym], *n3 = &t[3][c3 * 256 + sym];
-      Prob *n4 = SZ_ORDER5 ? &t[4][c5 * 256 + sym] : nullptr;
+      Prob *n4 = (SZ_ORDER5 && !(gap_mode && SZ_NO5_B)) ? &t[4][c5 * 256 + sym] : nullptr;
       Prob *n5 = &t[5][cw * 256 + sym];
       const uint32_t wk = wctx((uint32_t)k, h, st);
       const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5);
@@ -322,7 +325,7 @@ struct MixLit {
       nodes[step][1] = &t[1][c1 * 256 + sym];
       nodes[step][2] = &t[2][c2 * 256 + sym];
       nodes[step][3] = &t[3][c3 * 256 + sym];
-      nodes[step][4] = SZ_ORDER5 ? &t[4][c5 * 256 + sym] : nullptr;
+      nodes[step][4] = (SZ_ORDER5 && !(gap_mode && SZ_NO5_B)) ? &t[4][c5 * 256 + sym] : nullptr;
       nodes[step][5] = &t[5][cw * 256 + sym];
       for (int j = 0; j < 6; ++j) saved_n[step][j] = nodes[step][j] ? *nodes[step][j] : 0;
       const uint32_t wk = wctx((uint32_t)(7 - k), h, st);
