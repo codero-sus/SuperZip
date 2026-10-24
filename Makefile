@@ -1,6 +1,6 @@
 # G0D SZIP — build (C++ engine). Rust workspace builds with cargo (see rust/).
 CXX      ?= g++
-CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wshadow -Wconversion -DNDEBUG -pthread
+CXXFLAGS ?= -std=c++17 -O3 -Wall -Wextra -Wshadow -Wconversion -DNDEBUG -pthread
 BUILD    := build
 
 NATIVE   := native/codec.cpp native/cli.cpp

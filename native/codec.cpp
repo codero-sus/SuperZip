@@ -765,13 +765,13 @@ int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
       if (off == 0 || off > out_pos) return SZIP_ERR_CORRUPT;
       if (len > n - out_pos) return SZIP_ERR_CORRUPT;
 
-      for (uint32_t i = 0; i < len; ++i)
-        dst[out_pos + i] = dst[out_pos - off + i];
       reps_after_rep(reps, idx);
       st = 1;
       for (uint32_t i = 0; i < len; ++i) {
+        const uint8_t b = dst[out_pos - off + i];
+        dst[out_pos + i] = b;
         const uint8_t mb = (uint8_t)(((out_pos + i) >= reps[0]) ? dst[out_pos + i - reps[0]] : 0);
-        mix.train_byte(hist, dst[out_pos + i], mb, st);
+        mix.train_byte(hist, b, mb, st);
       }
       out_pos += len;
     } else {
@@ -787,13 +787,13 @@ int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
       if (off == 0 || off > out_pos) return SZIP_ERR_CORRUPT;
       if (len > n - out_pos) return SZIP_ERR_CORRUPT;
 
-      for (uint32_t i = 0; i < len; ++i)
-        dst[out_pos + i] = dst[out_pos - off + i];
       reps_after_normal(reps, off);
       st = 2;
       for (uint32_t i = 0; i < len; ++i) {
+        const uint8_t b = dst[out_pos - off + i];
+        dst[out_pos + i] = b;
         const uint8_t mb = (uint8_t)(((out_pos + i) >= reps[0]) ? dst[out_pos + i - reps[0]] : 0);
-        mix.train_byte(hist, dst[out_pos + i], mb, st);
+        mix.train_byte(hist, b, mb, st);
       }
       out_pos += len;
     }
