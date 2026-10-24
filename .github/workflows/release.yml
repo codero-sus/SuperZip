@@ -110,11 +110,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
-            gh release upload "${{ github.ref_name }}" dist/* --clobber
-            gh release edit "${{ github.ref_name }}" --prerelease --title "G0D SZIP ${{ github.ref_name }} (preview)" --notes-file notes.md
+          set +e
+          which gh || echo "::error::gh CLI not on PATH"
+          gh --version 2>&1 | head -1
+          out=$(gh release view "${{ github.ref_name }}" 2>&1 >/dev/null)
+          if [ $? -eq 0 ]; then
+            gh release upload "${{ github.ref_name }}" dist/* --clobber 2>&1 | tee /tmp/e.txt
+            gh release edit "${{ github.ref_name }}" --prerelease --title "G0D SZIP ${{ github.ref_name }} (preview)" --notes-file notes.md 2>&1 | tee /tmp/e.txt
           else
+            echo "no existing release ($out)"
             gh release create "${{ github.ref_name }}" --prerelease \
               --title "G0D SZIP ${{ github.ref_name }} (preview)" \
-              --notes-file notes.md dist/*
+              --notes-file notes.md dist/* 2>&1 | tee /tmp/e.txt
           fi
+          rc=$?
+          echo "gh exit code: $rc"
+          tail -5 /tmp/e.txt | while IFS= read -r l; do echo "::error::gh: $l"; done
+          exit $rc
