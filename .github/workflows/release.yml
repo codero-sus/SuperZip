@@ -90,22 +90,31 @@ jobs:
         with:
           name: beatsniper-log
           path: dist
-      - name: create pre-release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: assemble notes
         run: |
+          ls -laR dist
+          log=$(find dist -name beatsniper.log | head -1)
           {
             echo "G0D SZIP preview build (${{ github.ref_name }}) — own encoder + own decoder, .szip format v4."
             echo
             echo "Dual-mode DP-optimal compressor (word/gap literal models, 4-pass parse, GOD-stage context mixing)."
             echo "Frozen-corpus scoreboard (tests/beatsniper.sh):"
             echo '```'
-            cat dist/beatsniper.log
+            cat "$log"
             echo '```'
             echo
-            echo "Binaries: Linux x86-64, macOS arm64, Windows x86-64 (MinGW). Usage: \`g0dszip c <in> <out.szip>\` / \`g0dszip d <in.szip> <out>\`."
+            echo "Binaries: Linux x86-64, macOS arm64, Windows x86-64 (static MinGW). Usage: g0dszip c <in> <out.szip> / g0dszip d <in.szip> <out>."
             echo "Note: the stretch goal '4% under xz-9e' currently lands 85 bytes short on code (17,018 vs 16,933); everything else in the table is a win."
           } > notes.md
-          gh release create "${{ github.ref_name }}" --prerelease \
-            --title "G0D SZIP ${{ github.ref_name }} (preview)" \
-            --notes-file notes.md dist/*
+      - name: create pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            gh release upload "${{ github.ref_name }}" dist/* --clobber
+            gh release edit "${{ github.ref_name }}" --prerelease --title "G0D SZIP ${{ github.ref_name }} (preview)" --notes-file notes.md
+          else
+            gh release create "${{ github.ref_name }}" --prerelease \
+              --title "G0D SZIP ${{ github.ref_name }} (preview)" \
+              --notes-file notes.md dist/*
+          fi
