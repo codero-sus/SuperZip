@@ -63,7 +63,7 @@ jobs:
         shell: msys2 {0}
         run: |
           g++ -std=c++17 -O3 -Wall -Wextra -Wshadow -Wconversion -DNDEBUG \
-              -Inative native/codec.cpp native/cli.cpp native/gui.cpp -o ${{ matrix.asset }} -pthread -static
+              -Inative native/codec.cpp native/cli.cpp native/gui.cpp -o ${{ matrix.asset }} -pthread -static -lws2_32
       - name: smoke (windows, mingw)
         if: runner.os == 'Windows'
         shell: msys2 {0}
