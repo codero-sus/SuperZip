@@ -1,5 +1,6 @@
 # G0D SZIP — build (C++ engine). Rust workspace builds with cargo (see rust/).
 CXX      ?= g++
+LDLIBS   ?=            # MinGW: make LDLIBS=-lws2_32 (winsock for the GUI)
 CXXFLAGS ?= -std=c++17 -O3 -Wall -Wextra -Wshadow -Wconversion -DNDEBUG -pthread
 BUILD    := build
 
@@ -14,7 +15,7 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 $(BUILD)/g0dszip: $(NATIVE) native/szip.h native/rc.hpp native/crc32.hpp native/lz77.hpp native/mix.hpp native/tables.hpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) -Inative $(NATIVE) -o $@ -pthread
+	$(CXX) $(CXXFLAGS) -Inative $(NATIVE) -o $@ -pthread $(LDLIBS)
 
 $(BUILD)/test_szip: $(TESTS) native/codec.cpp native/szip.h native/rc.hpp native/crc32.hpp native/lz77.hpp native/mix.hpp native/tables.hpp | $(BUILD)
 	$(CXX) -std=c++17 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -Wall -Wextra -Inative $(TESTS) native/codec.cpp -o $@ -pthread
