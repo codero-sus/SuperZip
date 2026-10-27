@@ -6,6 +6,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -287,7 +289,11 @@ int run_gui(unsigned short port) {
   std::fflush(stdout);
   for (;;) {
     sockaddr_in ca;
+#ifdef _WIN32
+    int cl = sizeof(ca);
+#else
     socklen_t cl = sizeof(ca);
+#endif
     sock_t c = accept(l, (sockaddr *)&ca, &cl);
     if (c < 0) continue;
     std::thread(handle_client, c).detach();
