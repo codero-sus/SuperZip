@@ -12,6 +12,7 @@
 #include <chrono>
 #include <sstream>
 #include <memory>
+#include <cstdlib>
 #include <fstream>
 #include <vector>
 
@@ -41,10 +42,11 @@ namespace {
 // ---------------------------------------------------------------- models --
 
 struct Model {
+  uint32_t regime = 0; // 0: v4 shared token models; 2: tight split models
   Prob is_match = kProbInit;
   Prob is_rep = kProbInit;
   Prob rep_sel[2] = {kProbInit, kProbInit}; // 0: rep0|rep12, 1: rep1|rep2
-  Prob len_unary[10];             // gamma of (len - 2)
+  Prob len_unary[10];             // gamma of (len - 2) (regime 0 shared)
   Prob len_bits[10];
   Prob off_mode = kProbInit;      // 0: tiny (off 1-4), 1: slot+direct
   Prob tiny_unary[8];             // gamma of (off), x in [1, 4]
@@ -54,9 +56,26 @@ struct Model {
   Prob off_direct[19];            // raw high bits of off-1
   Prob off_align[16];             // 4-bit align tree for the low bits
 
-  Model() {
+  // -- regime-2 extras (appended: v4 field layout above is frozen so old
+  //    files decode with byte-identical probability evolution) --
+  Prob nlen_unary[11];            // normal-match length (idx 0..10 used)
+  Prob nlen_bits[11];
+  Prob rlen_unary[11];            // rep length
+  Prob rlen_bits[11];
+  Prob slot_cls[4][12];           // slot model per length class
+  Prob slotb_cls[4][10];
+
+  explicit Model(uint32_t regime_ = 0) : regime(regime_) {
     std::fill(std::begin(len_unary), std::end(len_unary), static_cast<Prob>(kProbInit));
     std::fill(std::begin(len_bits), std::end(len_bits), static_cast<Prob>(kProbInit));
+    for (auto &r : nlen_unary) r = static_cast<Prob>(kProbInit);
+    for (auto &r : nlen_bits) r = static_cast<Prob>(kProbInit);
+    for (auto &r : rlen_unary) r = static_cast<Prob>(kProbInit);
+    for (auto &r : rlen_bits) r = static_cast<Prob>(kProbInit);
+    for (auto &row : slot_cls)
+      for (auto &x : row) x = static_cast<Prob>(kProbInit);
+    for (auto &row : slotb_cls)
+      for (auto &x : row) x = static_cast<Prob>(kProbInit);
     std::fill(std::begin(tiny_unary), std::end(tiny_unary), static_cast<Prob>(kProbInit));
     std::fill(std::begin(tiny_bits), std::end(tiny_bits), static_cast<Prob>(kProbInit));
     std::fill(std::begin(slot_unary), std::end(slot_unary), static_cast<Prob>(kProbInit));
@@ -98,7 +117,7 @@ int decode_gamma(RcDecoder &rc, Prob *unary, Prob *bits, uint32_t n_max,
 // Offset: u = off - 1, n = bitlen(u).
 //   tiny mode  (off 1-4):      gamma(off)
 //   slot mode  (off >= 5):     gamma(n - 2), then n-1 direct low bits of u
-void encode_offset(RcEncoder &rc, Model &m, uint32_t off) {
+void encode_offset(RcEncoder &rc, Model &m, uint32_t off, uint32_t len) {
   const uint32_t u = off - 1;
 #if SZ_STATS
   { uint32_t nn = 0; while ((1u << nn) <= u) ++nn; ++st_nhist[nn]; }
@@ -111,7 +130,13 @@ void encode_offset(RcEncoder &rc, Model &m, uint32_t off) {
   rc.encode_bit(m.off_mode, 1);
   uint32_t n = 0;
   while ((1u << n) <= u) ++n;
-  encode_gamma(rc, m.slot_unary, m.slot_bits, n - 2);
+  if (m.regime) {
+    const uint32_t c = len - 2;
+    const uint32_t cls = c < 3 ? c : 3;
+    encode_gamma(rc, m.slot_cls[cls], m.slotb_cls[cls], n - 2);
+  } else {
+    encode_gamma(rc, m.slot_unary, m.slot_bits, n - 2);
+  }
   const uint32_t ncoded = n - 1;
   const uint32_t ntree = ncoded < 4 ? ncoded : 4;
   if (SZ_ALIGN) {
@@ -143,7 +168,7 @@ static void train_gamma(Prob *unary, Prob *bits, uint32_t x) {
   for (uint32_t i = n; i-- > 0;) bit_train(bits[i], (x >> i) & 1u);
 }
 
-static void train_offset(Model &m, uint32_t off) {
+static void train_offset(Model &m, uint32_t off, uint32_t len) {
   const uint32_t u = off - 1;
   if (u < 4) {
     bit_train(m.off_mode, 0);
@@ -153,7 +178,13 @@ static void train_offset(Model &m, uint32_t off) {
   bit_train(m.off_mode, 1);
   uint32_t n = 0;
   while ((1u << n) <= u) ++n;
-  train_gamma(m.slot_unary, m.slot_bits, n - 2);
+  if (m.regime) {
+    const uint32_t c = len - 2;
+    const uint32_t cls = c < 3 ? c : 3;
+    train_gamma(m.slot_cls[cls], m.slotb_cls[cls], n - 2);
+  } else {
+    train_gamma(m.slot_unary, m.slot_bits, n - 2);
+  }
   for (uint32_t i = n - 1; i-- > 0;)
     bit_train(m.off_direct[i], (u >> i) & 1u);
 }
@@ -163,14 +194,20 @@ static void train_rep_token(Model &m, uint32_t idx, uint32_t len) {
   bit_train(m.is_rep, 1);
   bit_train(m.rep_sel[0], idx == 0 ? 0u : 1u);
   if (idx != 0) bit_train(m.rep_sel[1], idx == 1 ? 0u : 1u);
-  train_gamma(m.len_unary, m.len_bits, len - 2);
+  if (m.regime)
+    train_gamma(m.rlen_unary, m.rlen_bits, len - 2);
+  else
+    train_gamma(m.len_unary, m.len_bits, len - 2);
 }
 
 static void train_norm_token(Model &m, uint32_t off, uint32_t len) {
   bit_train(m.is_match, 1);
   bit_train(m.is_rep, 0);
-  train_offset(m, off);
-  train_gamma(m.len_unary, m.len_bits, len - 2);
+  train_offset(m, off, len);
+  if (m.regime)
+    train_gamma(m.nlen_unary, m.nlen_bits, len - 2);
+  else
+    train_gamma(m.len_unary, m.len_bits, len - 2);
 }
 
 // ---- read-only token prices (1/16-bit units) for parse decisions ----------
@@ -188,7 +225,19 @@ static uint32_t price_gamma_p(const Prob *unary, const Prob *bits, uint32_t x) {
   return price;
 }
 
-static uint32_t price_offset_p(const Model &m, uint32_t off) {
+static uint32_t len_class(uint32_t len) {
+  const uint32_t c = len - 2;
+  return c < 3 ? c : 3;
+}
+
+static uint32_t price_len(const Model &m, bool rep, uint32_t len) {
+  if (m.regime)
+    return price_gamma_p(rep ? m.rlen_unary : m.nlen_unary,
+                         rep ? m.rlen_bits : m.nlen_bits, len - 2);
+  return price_gamma_p(m.len_unary, m.len_bits, len - 2);
+}
+
+static uint32_t price_offset_p(const Model &m, uint32_t off, uint32_t len) {
   const uint32_t u = off - 1;
   if (u < 4) {
     return price_bit(m.off_mode, 0) +
@@ -197,7 +246,12 @@ static uint32_t price_offset_p(const Model &m, uint32_t off) {
   uint32_t price = price_bit(m.off_mode, 1);
   uint32_t n = 0;
   while ((1u << n) <= u) ++n;
-  price += price_gamma_p(m.slot_unary, m.slot_bits, n - 2);
+  if (m.regime) {
+    const uint32_t cls = len_class(len);
+    price += price_gamma_p(m.slot_cls[cls], m.slotb_cls[cls], n - 2);
+  } else {
+    price += price_gamma_p(m.slot_unary, m.slot_bits, n - 2);
+  }
   const uint32_t ncoded = n - 1;
   const uint32_t ntree = ncoded < 4 ? ncoded : 4;
   if (SZ_ALIGN) {
@@ -220,18 +274,18 @@ static uint32_t price_offset_p(const Model &m, uint32_t off) {
   uint32_t price = price_bit(m.is_match, 1) + price_bit(m.is_rep, 1);
   price += price_bit(m.rep_sel[0], idx == 0 ? 0u : 1u);
   if (idx != 0) price += price_bit(m.rep_sel[1], idx == 1 ? 0u : 1u);
-  price += price_gamma_p(m.len_unary, m.len_bits, len - 2);
+  price += price_len(m, true, len);
   return price;
 }
 
 [[maybe_unused]] static uint32_t price_norm_token(const Model &m, uint32_t off, uint32_t len) {
   uint32_t price = price_bit(m.is_match, 1) + price_bit(m.is_rep, 0);
-  price += price_offset_p(m, off);
-  price += price_gamma_p(m.len_unary, m.len_bits, len - 2);
+  price += price_offset_p(m, off, len);
+  price += price_len(m, false, len);
   return price;
 }
 
-int decode_offset(RcDecoder &rc, Model &m, uint32_t *out) {
+int decode_offset(RcDecoder &rc, Model &m, uint32_t len, uint32_t *out) {
   if (rc.decode_bit(m.off_mode) == 0) {
     uint32_t off = 0;
     int e = decode_gamma(rc, m.tiny_unary, m.tiny_bits, 6, &off);
@@ -241,7 +295,13 @@ int decode_offset(RcDecoder &rc, Model &m, uint32_t *out) {
     return SZIP_OK;
   }
   uint32_t x = 0;
-  int e = decode_gamma(rc, m.slot_unary, m.slot_bits, 10, &x);
+  int e;
+  if (m.regime) {
+    const uint32_t cls = len_class(len);
+    e = decode_gamma(rc, m.slot_cls[cls], m.slotb_cls[cls], 10, &x);
+  } else {
+    e = decode_gamma(rc, m.slot_unary, m.slot_bits, 10, &x);
+  }
   if (e != SZIP_OK) return e;
   if (x < 1 || x > 18) return SZIP_ERR_CORRUPT;
   const uint32_t n = x + 2;
@@ -438,9 +498,9 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
     }
   }
 
-  Model ms;                 // online-calibrated price model
-  std::unique_ptr<MixLit> mix; // live literal prices (unguided pass only)
-  if (!guide) mix.reset(new MixLit(mode));
+  Model ms(mode >= 2 ? 2u : 0u); // online-calibrated price model
+  std::unique_ptr<MixLit> mix;   // live literal prices (unguided pass only)
+  if (!guide) mix.reset(new MixLit(mode & 1u));
   Hist hist;
 
   std::vector<DPNode> pool;
@@ -509,6 +569,7 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
   std::vector<uint32_t> lens;
   lens.reserve(64);
   std::vector<uint32_t> lenp(kMaxMatch + 1, 0);
+  std::vector<uint32_t> lenpr(kMaxMatch + 1, 0);
 
   for (uint32_t pos = 0; pos < n; ++pos) {
     if (best_cnt[pos] == 0) continue;
@@ -559,18 +620,30 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
     // candidate distance ONCE instead of per (arrival, candidate, length).
     // Only price the lengths this position can actually offer.
     uint32_t norm_prefix[16];
+    uint32_t offp[16][4]; // regime 2: offset price per length class
     uint32_t max_need = kMinMatch;
     for (uint32_t ci = 0; ci < ncand && ci < mcc; ++ci) {
-      norm_prefix[ci] = price_bit(ms.is_match, 1) + price_bit(ms.is_rep, 0) +
-                        price_offset_p(ms, cands[ci].off);
+      norm_prefix[ci] = price_bit(ms.is_match, 1) + price_bit(ms.is_rep, 0);
+      if (ms.regime) {
+        for (uint32_t cls = 0; cls < 4; ++cls)
+          offp[ci][cls] = price_offset_p(ms, cands[ci].off, cls + 2);
+      } else {
+        norm_prefix[ci] += price_offset_p(ms, cands[ci].off, 2);
+      }
       if (cands[ci].len > max_need) max_need = cands[ci].len;
     }
     if (!SZ_DP_NO_REP) {
       // the rep branch runs per arrival; cheap bound: cover all lengths once
       if (kMaxMatch > max_need) max_need = max_need; // capped below by needs
     }
-    for (uint32_t l = kMinMatch; l <= max_need && l <= kMaxMatch; ++l)
-      lenp[l] = price_gamma_p(ms.len_unary, ms.len_bits, l - 2);
+    for (uint32_t l = kMinMatch; l <= max_need && l <= kMaxMatch; ++l) {
+      if (ms.regime) {
+        lenp[l] = price_gamma_p(ms.nlen_unary, ms.nlen_bits, l - 2);
+        lenpr[l] = price_gamma_p(ms.rlen_unary, ms.rlen_bits, l - 2);
+      } else {
+        lenp[l] = price_gamma_p(ms.len_unary, ms.len_bits, l - 2);
+      }
+    }
 
     for (uint32_t bi = 0; bi < best_cnt[pos]; ++bi) {
       uint32_t idx = best_slot[(size_t)pos * kBeamSlots + bi];
@@ -603,9 +676,8 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
           reps_after_rep(nd.reps, rep.idx);
           for (uint32_t l : lens) {
             nd.cost = A.cost + rep_prefix +
-                      (l <= max_need ? lenp[l]
-                                     : price_gamma_p(ms.len_unary, ms.len_bits,
-                                                     l - 2));
+                      (l <= max_need ? (ms.regime ? lenpr[l] : lenp[l])
+                                     : price_len(ms, true, l));
             nd.len = l;
             try_insert(pos + l, nd);
           }
@@ -624,9 +696,8 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
         const uint32_t npref = norm_prefix[ci];
         for (uint32_t l : lens) {
           nd.cost = A.cost + npref +
-                    (l <= max_need ? lenp[l]
-                                   : price_gamma_p(ms.len_unary, ms.len_bits,
-                                                   l - 2));
+                    (ms.regime ? offp[ci][len_class(l)] : 0u) +
+                    (l <= max_need ? lenp[l] : price_len(ms, false, l));
           nd.len = l;
           try_insert(pos + l, nd);
         }
@@ -675,8 +746,8 @@ static void emit_plan(const uint8_t *src, uint32_t n,
                       std::vector<uint8_t> &out, uint32_t mode) {
   (void)n;
   RcEncoder rc(out);
-  Model m;
-  MixLit mix(mode);
+  Model m(mode >= 2 ? 2u : 0u);
+  MixLit mix(mode & 1u);
   Hist hist;
   uint32_t pos = 0;
   uint32_t reps[3] = {0, 0, 0};
@@ -703,7 +774,10 @@ static void emit_plan(const uint8_t *src, uint32_t n,
       rc.encode_bit(m.is_rep, 1);
       rc.encode_bit(m.rep_sel[0], tok.rep_idx == 0 ? 0u : 1u);
       if (tok.rep_idx != 0) rc.encode_bit(m.rep_sel[1], tok.rep_idx == 1 ? 0u : 1u);
-      encode_gamma(rc, m.len_unary, m.len_bits, tok.len - 2);
+      if (m.regime)
+        encode_gamma(rc, m.rlen_unary, m.rlen_bits, tok.len - 2);
+      else
+        encode_gamma(rc, m.len_unary, m.len_bits, tok.len - 2);
       reps_after_rep(reps, tok.rep_idx);
       st = 1;
       for (uint32_t i = pos; i < pos + tok.len; ++i) {
@@ -721,8 +795,14 @@ static void emit_plan(const uint8_t *src, uint32_t n,
 #endif
       rc.encode_bit(m.is_match, 1);
       rc.encode_bit(m.is_rep, 0);
-      encode_offset(rc, m, tok.off);
-      encode_gamma(rc, m.len_unary, m.len_bits, tok.len - 2);
+      if (m.regime) {
+        // tight regime: length first so the offset slot knows its class
+        encode_gamma(rc, m.nlen_unary, m.nlen_bits, tok.len - 2);
+        encode_offset(rc, m, tok.off, tok.len);
+      } else {
+        encode_offset(rc, m, tok.off, tok.len);
+        encode_gamma(rc, m.len_unary, m.len_bits, tok.len - 2);
+      }
       reps_after_normal(reps, tok.off);
       st = 2;
       for (uint32_t i = pos; i < pos + tok.len; ++i) {
@@ -801,8 +881,11 @@ static void encode_one_mode(const uint8_t *src, uint32_t n, uint32_t mode,
   out.swap(bestp);
 }
 
-// v4 payload = 1 mode byte (0 = word-shape t5, 1 = gap order-1 t5) + RC stream.
-// Both modes are coded; the actual smaller one ships (per-block self-tuning).
+// v5 payload = 1 mode byte + RC stream.  mode = (regime << 1) | mixer:
+//   0: v4 regime, word-shape t5    1: v4 regime, gap order-1 t5
+//   2: tight regime, word-shape    3: tight regime, gap order-1
+// All four are coded per block; the smallest payload ships (self-tuning).
+// v4 files (modes 0/1, version 4 headers) remain decodable.
 void encode_block_szlzrc(const uint8_t *src, uint32_t n,
                          std::vector<uint8_t> &out) {
   out.clear();
@@ -811,27 +894,40 @@ void encode_block_szlzrc(const uint8_t *src, uint32_t n,
   CandCache cc;
   build_cand_cache(src, n, cc);
   SZ_TOC(tc, "finder cache");
-  std::vector<uint8_t> a, b;
-  std::thread ta([&] { encode_one_mode(src, n, 0, cc, a); });
-  std::thread tb([&] { encode_one_mode(src, n, 1, cc, b); });
-  ta.join();
-  tb.join();
-  const bool gap = b.size() < a.size();
-  out.push_back(gap ? 1 : 0);
-  const std::vector<uint8_t> &pick = gap ? b : a;
-  out.insert(out.end(), pick.begin(), pick.end());
+  // Four candidate modes: 0/1 = v4 token regime x (word-shape | gap) mixer,
+  // 2/3 = tight regime (split len models + length-class offset slots) x same
+  // mixers.  All four are coded; the smallest payload ships (waves of two to
+  // bound peak memory).
+  std::vector<uint8_t> cand[4];
+  {
+    std::thread ta([&] { encode_one_mode(src, n, 0, cc, cand[0]); });
+    std::thread tb([&] { encode_one_mode(src, n, 1, cc, cand[1]); });
+    ta.join();
+    tb.join();
+  }
+  {
+    std::thread tc([&] { encode_one_mode(src, n, 2, cc, cand[2]); });
+    std::thread td([&] { encode_one_mode(src, n, 3, cc, cand[3]); });
+    tc.join();
+    td.join();
+  }
+  uint32_t best = 0;
+  for (uint32_t k = 1; k < 4; ++k)
+    if (cand[k].size() < cand[best].size()) best = k;
+  out.push_back((uint8_t)best); // mode byte: (regime << 1) | mixer
+  out.insert(out.end(), cand[best].begin(), cand[best].end());
 }
 
 int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
                         uint32_t n) {
   if (src_len < 6) return SZIP_ERR_TRUNCATED;
   const uint32_t mode = src[0];
-  if (mode > 1) return SZIP_ERR_CORRUPT;
+  if (mode > 3) return SZIP_ERR_CORRUPT;
   RcDecoder rc(src + 1, src_len - 1);
   if (!rc.init()) return SZIP_ERR_TRUNCATED;
 
-  Model m;
-  MixLit mix(mode);
+  Model m(mode >= 2 ? 2u : 0u);
+  MixLit mix(mode & 1u);
   Hist hist;
   uint32_t out_pos = 0;
   uint32_t reps[3] = {0, 0, 0};
@@ -850,7 +946,9 @@ int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
         idx = (rc.decode_bit(m.rep_sel[1]) == 0) ? 1u : 2u;
 
       uint32_t xlen = 0;
-      int e = decode_gamma(rc, m.len_unary, m.len_bits, 10, &xlen);
+      int e = m.regime
+                  ? decode_gamma(rc, m.rlen_unary, m.rlen_bits, 10, &xlen)
+                  : decode_gamma(rc, m.len_unary, m.len_bits, 10, &xlen);
       if (e != SZIP_OK) return e;
       if (!rc.ok()) return SZIP_ERR_TRUNCATED;
       const uint32_t len = xlen + 2;
@@ -870,11 +968,23 @@ int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
       out_pos += len;
     } else {
       uint32_t off = 0;
-      int e = decode_offset(rc, m, &off);
-      if (e != SZIP_OK) return e;
       uint32_t xlen = 0;
-      e = decode_gamma(rc, m.len_unary, m.len_bits, 10, &xlen);
-      if (e != SZIP_OK) return e;
+      int e;
+      if (m.regime) {
+        // tight regime: length first, then class-aware offset
+        e = decode_gamma(rc, m.nlen_unary, m.nlen_bits, 10, &xlen);
+        if (e != SZIP_OK) return e;
+        if (!rc.ok()) return SZIP_ERR_TRUNCATED;
+        const uint32_t len = xlen + 2;
+        if (len < kMinMatch || len > kMaxMatch) return SZIP_ERR_CORRUPT;
+        e = decode_offset(rc, m, len, &off);
+        if (e != SZIP_OK) return e;
+      } else {
+        e = decode_offset(rc, m, 2, &off);
+        if (e != SZIP_OK) return e;
+        e = decode_gamma(rc, m.len_unary, m.len_bits, 10, &xlen);
+        if (e != SZIP_OK) return e;
+      }
       if (!rc.ok()) return SZIP_ERR_TRUNCATED;
       const uint32_t len = xlen + 2;
       if (len < kMinMatch || len > kMaxMatch) return SZIP_ERR_CORRUPT;
@@ -958,7 +1068,7 @@ int read_and_check_header(std::istream &is, uint32_t *block_size,
   if (!is.read(reinterpret_cast<char *>(&ver), 1) ||
       !is.read(reinterpret_cast<char *>(&flags), 1))
     return SZIP_ERR_TRUNCATED;
-  if (ver != SZIP_VERSION) return SZIP_ERR_UNSUPPORTED;
+  if (ver != 4 && ver != SZIP_VERSION) return SZIP_ERR_UNSUPPORTED;
   uint16_t reserved = 0;
   if (!get_u16(is, &reserved)) return SZIP_ERR_TRUNCATED;
   if (!get_u32(is, block_size)) return SZIP_ERR_TRUNCATED;

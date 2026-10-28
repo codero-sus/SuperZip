@@ -84,22 +84,52 @@ Measured on this project's benchmark corpora (ratio = compressed/raw, lower
 is better; `tests/mkcorpus.sh` regenerates them; random data is stored so it
 never expands):
 
-| corpus | **G0D SZIP v4** | gzip-9 | bzip2-9 | xz-9e | zstd-22 | brotli-11 |
-|---|---|---|---|---|---|---|
-| source code (70,592 B) | **17,011 B** | 19,282 | 18,214 | 17,640 | 18,012 | 16,894 |
-| word-salad text (500,003 B) | **53,121 B** | 86,539 | 53,954 | 76,764 | 76,343 | 78,420 |
-| random (500,000 B) | **500,038 B** | 500,107 | 502,690 | 500,084 | 500,021 | 500,005 |
-| this repo's source (277,530 B) | **51,064 B** | 76,747 | 65,288 | 51,796 | 56,066 | 50,871 |
+| corpus (raw size) | **G0D SZIP v5** | gzip-9 | bzip2-9 | xz-9e | zstd-22 | brotli-11 | lz4 | snappy |
+|---|---|---|---|---|---|---|---|---|
+| code (70,592) | **17,011** | 19,282 | 18,214 | 17,640 | 18,012 | 16,894 | 23,869 | 29,674 |
+| text (500,003) | **53,121** | 86,539 | 53,954 | 76,764 | 76,343 | 78,420 | 106,834 | 150,185 |
+| rand (500,000) | **500,038** | 500,107 | 502,661 | 500,084 | 500,021 | 500,005 | 500,051 | 500,074 |
+| src (277,530) | **50,984** | 76,747 | 65,288 | 51,796 | 56,066 | 50,871 | 98,238 | 119,236 |
+| b64 (131,072) | **27,549** | 36,886 | 25,452 | 32,988 | 33,120 | 33,007 | 41,663 | 62,974 |
+| binary (131,072) | **65,559** | 69,440 | 67,809 | 65,172 | 67,291 | 63,470 | 79,812 | 93,102 |
+| csv (131,072) | **35,555** | 47,704 | 34,309 | 41,676 | 45,164 | 41,001 | 58,390 | 79,770 |
+| dict (131,072) | **32,527** | 53,651 | 41,951 | 36,660 | 33,750 | 28,837 | 67,227 | 90,899 |
+| dna (131,072) | **21,978** | 23,602 | 20,218 | 21,732 | 21,436 | 21,048 | 29,620 | 51,276 |
+| floats (131,072) | **93,356** | 99,781 | 100,734 | 84,992 | 97,335 | 92,123 | 107,673 | 131,098 |
+| hex (131,072) | **35,644** | 47,547 | 37,114 | 41,564 | 44,763 | 41,051 | 56,535 | 74,350 |
+| html (131,072) | **13,295** | 16,919 | 12,036 | 15,252 | 15,680 | 14,857 | 19,534 | 30,747 |
+| json (131,072) | **11,820** | 16,313 | 11,133 | 13,156 | 13,614 | 12,867 | 22,017 | 32,431 |
+| log (131,072) | **10,079** | 13,495 | 8,948 | 11,172 | 11,589 | 11,166 | 17,404 | 26,010 |
+| mixed (131,072) | **51,344** | 61,722 | 56,973 | 53,240 | 56,979 | 53,451 | 72,357 | 85,583 |
+| pcm (131,072) | **121,573** | 127,322 | 122,971 | 124,512 | 127,575 | 114,926 | 131,099 | 131,098 |
+| prose (131,072) | **27,402** | 36,679 | 28,427 | 33,292 | 33,285 | 32,793 | 42,781 | 61,607 |
+| sparse (131,072) | **—** | 1,034 | 1,020 | 912 | 820 | 786 | 1,331 | 6,921 |
+| utf8 (131,072) | **15,624** | 23,091 | 14,981 | 21,212 | 20,989 | 20,973 | 28,341 | 41,912 |
+| xml (131,072) | **16,278** | 20,903 | 13,835 | 17,768 | 18,924 | 17,142 | 25,667 | 34,636 |
 
-**G0D SZIP beats gzip, bzip2 and xz on every corpus**, and on text it beats
-*everything in the known universe* by 800+ bytes (bzip2 53,954 was the
-previous best there). `sh tests/benchall.sh` is the written universe
-benchmark: it runs every compressor available (gzip, bzip2, xz, zstd-22,
-brotli-11, lz4, snappy) at maximum settings on all four corpora, verifies
-every roundtrip byte-exact, and prints the honest scoreboard.
+Win/loss against the best alternative on each corpus (the written check is
+`sh tests/benchall.sh`, every roundtrip byte-exact):
 
-The frozen benchmark corpora live in `tests/corpus/` (including `src.bin`,
-the real-world source snapshot) so every number above is reproducible.
+| won | lost (to) |
+|---|---|
+| text **+1.54%** | code −0.69% (brotli), src −0.22% (brotli), rand −0.01% (brotli framing) |
+| hex **+3.96%** | b64 −8.24%, dna −8.71%, csv −3.63% (bzip2/BWT) |
+| mixed **+3.56%** | xml −17.66%, log −12.64%, html −10.46%, json −6.17%, utf8 −4.29%, dict −12.80% (bzip2 or brotli) |
+| prose **+3.61%** | binary −3.29%, pcm −5.78% (brotli), floats −9.84% (xz) |
+| | sparse: best-mode parse exceeds an hour on long zero runs (use `-f`; known bound to add) |
+
+**4 wins, 15 losses, 1 DNF — the honest scoreboard.** The pattern is
+consistent: G0D SZIP's LZ77 + adaptive context mixing is #1 or #2 almost
+everywhere and beats gzip, bzip2, xz, zstd, lz4 and snappy on many types, but
+two specialists keep their niches — **bzip2's BWT** wins on templated,
+suffix-rich text (xml/log/html/json/dna/dict/csv: 4-18%), and **brotli's
+static context model** wins on code-like and high-entropy binary data.
+Flipping those needs BWT-class transforms and static context maps (model v6
+research), not parse or container tuning.
+
+The frozen benchmark corpora live in `tests/corpus/` (`src.bin` = the
+real-world source snapshot) and `tests/corpus20.py` deterministically
+generates the 16 data types, so every number above is reproducible.
 
 Honest gaps (the benchall verdict, 1/4 first places): brotli's static-model
 edge on **code** (0.69%), this repo's **source** (0.38%), and **random**
@@ -118,10 +148,12 @@ them to `build/`) so these claims stay reproducible as the code evolves.
 The encoder parses each block by dynamic programming: every literal, rep, and
 match edge is priced exactly (the model's real coded cost, 1/256-bit
 resolution), six guided passes converge the plan, and every candidate is
-actually encoded — the smallest payload ships. Each block is encoded in both
-literal-model modes (word-shape for text, whitespace-gap for code) and the
+actually encoded — the smallest payload ships. Each block is encoded in **four
+modes** (v4 and "tight" token models × word-shape/gap literal mixers) and the
 mode byte in the payload selects the winner. All of it is encoder-side; the
 decoder just follows the mode byte. Any compliant parse policy interoperates.
+Format v5 streams add the tight regime (split rep/normal length models,
+length-class offset slots); the decoder still reads v4 files byte-exactly.
 `tests/beatsniper.sh` verifies roundtrips and the sniper scoreboard.
 
 ## Safety

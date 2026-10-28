@@ -166,6 +166,22 @@ def main():
     #   ./tests/mkcorpus.sh src
     if not os.path.exists(corpora[-1][1]):
         sys.exit("tests/corpus/src.bin missing — run ./tests/mkcorpus.sh src")
+    # 16 generated data types (deterministic): tests/corpus20.py
+    c20 = os.path.join(BUILD, "corpus20")
+    want20 = ["b64", "binary", "csv", "dict", "dna", "floats", "hex", "html",
+              "json", "log", "mixed", "pcm", "prose", "sparse", "utf8", "xml"]
+    if not all(os.path.exists(os.path.join(c20, n + ".bin")) for n in want20):
+        run([sys.executable, os.path.join("tests", "corpus20.py"), c20])
+    corpora += [(n, os.path.join(c20, n + ".bin")) for n in want20]
+
+    only = None
+    for a in sys.argv[1:]:
+        if a.startswith("--only="):
+            only = set(a.split("=", 1)[1].split(","))
+    if only:
+        corpora = [c for c in corpora if c[0] in only]
+        if not corpora:
+            sys.exit(f"--only matched nothing; have: {sorted(n for n, _ in corpora)}")
 
     cases = build_cases()
     failures = 0
@@ -213,7 +229,7 @@ def main():
         print(f"  {k:5s} {'WIN' if win else 'LOSS'}  vs {who}  ({'+' if win else ''}{delta:.2f}%)")
     print(f"\n  {wins}/{len(totals)} first places")
     print("  note: zstd/brotli/lz4/snappy need build/venv (sh tests/benchall.sh);")
-    print("        extensible codec IDs in .szip v4 leave room for more models.")
+    print("        extensible codec IDs in .szip v5 leave room for more models.")
     return 1 if failures else 0
 
 
