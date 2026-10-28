@@ -14,3 +14,11 @@ cp tests/corpus/code.bin build/corpus_code.bin
 cp tests/corpus/text.bin build/corpus_text.bin
 head -c 500000 /dev/urandom > build/corpus_rand.bin
 wc -c build/corpus_*.bin
+
+# real-world corpus: frozen snapshot of this repository's own source tree
+if [ "$1" = "src" ]; then
+  out=tests/corpus/src.bin
+  { find native tests docs rust -type f ! -name '*.bin' ! -name '*.szip' -print0 |
+      sort -z | xargs -0 cat; cat README.md; } > "$out"
+  echo "regenerated $out ($(wc -c < "$out") B) — commit it to re-freeze"
+fi

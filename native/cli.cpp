@@ -78,8 +78,8 @@ int cmd_info(const char *path) {
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    usage();
-    return 2;
+    // GUI is the default entry point: plain `g0dszip` opens it.
+    return szip::run_gui(8848);
   }
   const std::string cmd = argv[1];
 
