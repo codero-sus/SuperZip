@@ -60,9 +60,12 @@ int cmd_info(const char *path) {
   }
   std::fseek(f, 0, SEEK_END);
   const long comp = std::ftell(f);
+  int ver = SZIP_VERSION;
+  std::fseek(f, 4, SEEK_SET);
+  if (std::fread(&ver, 1, 1, f) != 1) ver = SZIP_VERSION;
   std::fclose(f);
   std::printf("file       : %s\n", path);
-  std::printf("format     : .szip v%d\n", SZIP_VERSION);
+  std::printf("format     : .szip v%d\n", ver);
   std::printf("codec      : SZLZRC v3 (LZ77 + rep-matches + context-mixing literals)\n");
   std::printf("raw size   : %llu bytes\n", (unsigned long long)raw);
   std::printf("archive    : %ld bytes\n", comp);

@@ -107,7 +107,7 @@ jobs:
             echo '```'
             echo
             echo "Binaries: Linux x86-64, macOS arm64, Windows x86-64 (static MinGW). Usage: g0dszip c <in> <out.szip> / g0dszip d <in.szip> <out>."
-            echo "Note: the stretch goal '4% under xz-9e' currently lands 78 bytes short on code (17,011 vs 16,933); everything else in the table is a win. Universe benchmark: sh tests/benchall.sh (beats zstd/bzip2/xz/gzip everywhere; brotli edges code/src/rand framing)."
+            echo "Note: stretch goal '4% under xz-9e' is 78 bytes short on code (17,011 vs 16,933). 20-corpus universe bench (sh tests/benchall.sh): wins text/hex/mixed/prose outright, top-2 nearly everywhere; bzip2 (BWT) keeps templated-text niches, brotli keeps code/binary. Full honest table in README."
           } > notes.md
       - name: create pre-release
         env:

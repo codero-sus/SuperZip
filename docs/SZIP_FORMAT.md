@@ -1,4 +1,4 @@
-# G0D SZIP — `.szip` Container Format (v4)
+# G0D SZIP — `.szip` Container Format (v5)
 
 Reference project: **SuperZip / G0D SZIP**. This document is normative for the
 byte layout of `.szip` archives and the SZLZRC v3 bitstream.
@@ -30,23 +30,25 @@ header (20 bytes) | block* | footer (8 bytes)
 | off | size | field |
 |-----|------|-------|
 | 0   | 4    | magic `"SZP1"` |
-| 4   | 1    | `version` = `3` |
-| 5   | 1    | flags (bit0 = stream CRC present; always 1) |
+| 4   | 1    | `version` = `5` (v4 headers are also accepted) |
+| 5   | 1    | flags (reserved, zero) |
 | 6   | 2    | reserved, zero |
-| 8   | 8    | `raw_size` (total uncompressed bytes, LE u64) |
+| 8   | 4    | `block_size` (max block raw size, LE u32) |
+| 12  | 8    | `total_raw` (total uncompressed bytes, LE u64) |
 
 ### 1.2 Block framing
 
-Each block: `type` (1 byte), `pad` (1 byte, zero), `comp_size` (LE u24,
-bytes after the 4-byte prefix), payload (`comp_size` bytes).
+Each block header (10 bytes, LE): `type` (1), `pad` (1, zero), `raw_size` (4),
+`comp_size` (4), then `comp_size` payload bytes. The file ends with the
+stream CRC32 (4 bytes, LE) and the end magic `"SZP1"` (4 bytes).
 
 | type | codec |
 |------|-------|
-| 0    | stored (raw copy) |
-| 1    | SZLZRC v4 payload: 1 mode byte (`0` = word mode, `1` = gap mode) then the RC stream |
+| 0    | stored (raw copy, `comp_size == raw_size`) |
+| 1    | SZLZRC payload: 1 mode byte then the RC stream (see §2) |
 | other| reserved |
 
-Sum of block `raw_size` fields must equal the header `raw_size`.
+Sum of block `raw_size` fields must equal the header `total_raw`.
 
 ### 1.3 Footer (8 bytes)
 
@@ -57,7 +59,19 @@ Sum of block `raw_size` fields must equal the header `raw_size`.
 
 ## 2. Block codec: SZLZRC v4 (`type = 1`)
 
-**S**uper**Z**ip **LZ**77 + **R**ange **C**oder + context mixing, v4.
+**S**uper**Z**ip **LZ**77 + **R**ange **C**oder + context mixing, v5.
+
+The payload begins with one **mode byte** = `(regime << 1) | mixer`:
+
+| mode | regime | mixer | availability |
+|------|--------|-------|--------------|
+| 0 | v4 token models | word-shape t5 | v4 + v5 decoders |
+| 1 | v4 token models | gap order-1 t5 | v4 + v5 decoders |
+| 2 | tight token models | word-shape t5 | v5 decoders |
+| 3 | tight token models | gap order-1 t5 | v5 decoders |
+
+A v5 encoder codes all four per block and stores the smallest. v4 files
+(header version 4, mode 0/1) decode byte-exactly with the v5 decoder.
 
 Pipeline: LZ77 factorization (hash chains, price-aware parse, 1 MiB window,
 last-3 rep offsets) → token stream → adaptive binary range coder (carryless,
@@ -90,7 +104,11 @@ arithmetic, but `p` is supplied externally and is *not* updated by the coder.
 - `is_match` — literal vs match flag
 - `is_rep` — rep match vs normal match
 - `rep_sel[2]` — rep index: bit0 `0`→rep0, `1`→rep1/2; bit1 `0`→rep1, `1`→rep2
-- `len_unary[12]`, `len_bits[10]` — Elias gamma of `len - 2`
+- `len_unary[10]`, `len_bits[10]` — Elias gamma of `len - 2` (regime 0, shared)
+- regime 2 only: `nlen_unary[11]`/`nlen_bits[11]` (normal-match length) and
+  `rlen_unary[11]`/`rlen_bits[11]` (rep length) replace the shared model
+- regime 2 only: `slot_cls[4][12]`/`slotb_cls[4][10]` — slot model per
+  length class `min(len - 2, 3)` (replaces the shared slot model)
 - `off_mode` — offset mode flag
 - `tiny_unary[8]`, `tiny_bits[8]` — Elias gamma of `off` (tiny mode)
 - `slot_unary[12]`, `slot_bits[10]` — Elias gamma of `n - 2` (slot mode)
@@ -120,9 +138,12 @@ repeat until raw_size bytes are produced:
             offset = rep[idx]                          (must be != 0, <= out_pos)
             rep update: if idx > 0 { tmp=rep[idx]; shift; rep0=tmp }
        0 -> normal match:
-            offset code (below)
+            offset code (below)          [regime 0]
             len  = gamma(len_unary/len_bits) + 2      in [3, 2048]
             rep update: rep2=rep1; rep1=rep0; rep0=offset
+            -- regime 2 (modes 2/3) reverses the order: len first
+               (gamma(nlen_unary/nlen_bits)), then the offset code whose
+               slot model is selected by class = min(len-2, 3)
        copy len bytes from out_pos - offset (overlap allowed)
        for each copied byte b in order: MIXTRAIN(hist, b); push(hist, b)
 ```
@@ -134,7 +155,9 @@ repeat until raw_size bytes are produced:
 **Offset code** (`u = off - 1`, `n = bitlen(u)`):
 
 - `u < 4` (off 1..4): `off_mode = 0`, then `gamma(off)`
-- else: `off_mode = 1`, then `gamma(n - 2)`, then the `n - 1` mantissa bits
+- else: `off_mode = 1`, then `gamma(n - 2)` (model `slot_unary/slot_bits` in
+  regime 0; `slot_cls[cls]/slotb_cls[cls]`, `cls = min(len-2, 3)`, in
+  regime 2), then the `n - 1` mantissa bits
   of `u` (top bit of `u` implicitly `1`): the low `min(n-1, 4)` bits are
   coded through the 4-bit **align tree** `off_align` (binary tree, node `idx`
   starts at `1`, `idx = 2*idx + bit`), the remaining high bits with
@@ -229,8 +252,9 @@ respecting the grammar decodes correctly. The shipped encoder uses
 - Edge prices are exact (the models' live coded costs, `BIT_PRICE` at
   1/256-bit units; literal edges use the mixer's shadow price, trained bit by
   bit while pricing and restored afterwards).
-- Four planning passes run per mode (beam width 8); each pass after the
-  first calibrates the price model along the previous plan's exact token
+- Planning passes run per mode (default 6, beam 8 for pass 1 and 32 for the
+  guided passes; up to 24 match candidates per position); each pass after
+  the first calibrates the price model along the previous plan's exact token
   history. Every candidate plan is encoded and the ACTUAL smaller payload
   ships. Both modes (mode byte `0`/`1`) are encoded per block and the smaller
   payload ships there too. The decoder cannot observe any of this.
@@ -258,3 +282,11 @@ syntax is unchanged from v2. `version = 4` (2026-10-24) changes the mixer
 (exact order-1, gap/word dual mode with per-mode rates, whitespace `wpos`),
 the offset code (align tree), and prefixes each coded payload with its mode
 byte. v1-v3 streams are rejected by the version field.
+
+`version = 5` (2026-10-28) extends the mode byte to `(regime << 1) | mixer`
+(modes 0-3). Mode 2/3 ("tight" regime) splits the length model by token
+class (rep vs normal) and selects the offset-slot model by length class
+`min(len - 2, 3)`, emitting `len` before the offset code. v5 encoders code
+all four modes per block and store the smallest. v4 streams (version 4
+header, mode 0/1) decode byte-exactly with a v5 decoder; v5 mode-2/3
+streams are rejected by v4 decoders.
