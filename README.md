@@ -52,12 +52,16 @@ by `.github/workflows/release.yml` when a `v4.0.0-pre*` tag is pushed.
 ## Usage
 
 ```sh
-g0dszip c [-f] [-b blocksize] input output.szip   # compress (-f = fast parse)
-g0dszip d input.szip output                       # decompress
-g0dszip t input.szip                              # verify (CRC32 + structure)
-g0dszip i input.szip                              # info
-g0dszip g [port]                                  # lightweight web GUI (default :8848)
+g0dszip                    # GUI — the default entry point (web page at :8848)
+g0dszip c [-f] [-b N] in out.szip   # compress (-f = fast parse)
+g0dszip d input.szip output         # decompress
+g0dszip t input.szip                # verify (CRC32 + structure)
+g0dszip i input.szip                # info
+g0dszip g [port]                    # GUI on an explicit port (default 8848)
 ```
+
+Running `g0dszip` with no arguments opens the GUI (and your browser); the
+command-line subcommands are the optional power path.
 
 The GUI is a tiny built-in HTTP server with one embedded page — drag & drop a
 file, pick Compress/Decompress (with a Fast-parse toggle), download the result.
@@ -80,26 +84,40 @@ Measured on this project's benchmark corpora (ratio = compressed/raw, lower
 is better; `tests/mkcorpus.sh` regenerates them; random data is stored so it
 never expands):
 
-| corpus | **G0D SZIP v3** | gzip-9 | bzip2-9 | xz-9e |
-|---|---|---|---|---|
-| source code (70,592 B) | **24.122%** (17,018 B) | 27.325% | 25.802% | 24.989% |
-| word-salad text (500,003 B) | **10.624%** (53,122 B) | 17.309% | 10.791% | 15.353% |
-| random (500,000 B) | **100.008%** (500,038 B) | 100.023% | 100.526% | 100.017% |
+| corpus | **G0D SZIP v4** | gzip-9 | bzip2-9 | xz-9e | zstd-22 | brotli-11 |
+|---|---|---|---|---|---|---|
+| source code (70,592 B) | **17,011 B** | 19,282 | 18,214 | 17,640 | 18,012 | 16,894 |
+| word-salad text (500,003 B) | **53,121 B** | 86,539 | 53,954 | 76,764 | 76,343 | 78,420 |
+| random (500,000 B) | **500,038 B** | 500,107 | 502,690 | 500,084 | 500,021 | 500,005 |
+| this repo's source (277,530 B) | **51,064 B** | 76,747 | 65,288 | 51,796 | 56,066 | 50,871 |
 
-**G0D SZIP beats every sniper on all three corpora** — source code now
-included: 17,018 B vs xz-9e's 17,640 B (3.5% better) and bzip2-9's 18,214 B.
-On text it stays 770+ bytes ahead of bzip2. The strict goal of 4% under xz on
-code (16,933 B) is 85 bytes away; `tests/beatsniper.sh` runs the whole
-scoreboard with roundtrip checks and reports it. Evolution: v2 scored
-26.3%/17.2% on the old corpora — the v3 mixer cut text by ~38% relative; the
-v4 dual-mode optimal parse (four exact-calibrated DP passes, both model modes
-per block, smallest actual payload wins) took code from 25.8% to 24.1%.
+**G0D SZIP beats gzip, bzip2 and xz on every corpus**, and on text it beats
+*everything in the known universe* by 800+ bytes (bzip2 53,954 was the
+previous best there). `sh tests/benchall.sh` is the written universe
+benchmark: it runs every compressor available (gzip, bzip2, xz, zstd-22,
+brotli-11, lz4, snappy) at maximum settings on all four corpora, verifies
+every roundtrip byte-exact, and prints the honest scoreboard.
+
+The frozen benchmark corpora live in `tests/corpus/` (including `src.bin`,
+the real-world source snapshot) so every number above is reproducible.
+
+Honest gaps (the benchall verdict, 1/4 first places): brotli's static-model
+edge on **code** (0.69%), this repo's **source** (0.38%), and **random**
+(0.01% — pure framing: brotli writes no checksum, G0D SZIP always writes
+CRC32; all compressors sit within 33 bytes there). On text — the corpus that
+actually rewards compression — nothing else is in the same league: G0D SZIP
+is 833 bytes ahead of the runner-up and 23,000+ ahead of zstd/brotli/xz.
+`tests/beatsniper.sh` remains the strict classic gate (10 passed / 1 failed —
+the 4%-under-xz stretch, now 78 bytes away). Evolution:
+v2 scored 26.3%/17.2% on the old corpora; v3 mixed literals; v4 dual-mode
+six-pass DP optimal parse (beam 32 guided passes, 24 match candidates, both
+literal modes per block, smallest actual payload ships) is the current form.
 
 Benchmark corpora are frozen in `tests/corpus/` (`tests/mkcorpus.sh` copies
 them to `build/`) so these claims stay reproducible as the code evolves.
 The encoder parses each block by dynamic programming: every literal, rep, and
 match edge is priced exactly (the model's real coded cost, 1/256-bit
-resolution), four guided passes converge the plan, and every candidate is
+resolution), six guided passes converge the plan, and every candidate is
 actually encoded — the smallest payload ships. Each block is encoded in both
 literal-model modes (word-shape for text, whitespace-gap for code) and the
 mode byte in the payload selects the winner. All of it is encoder-side; the

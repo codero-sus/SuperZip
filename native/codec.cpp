@@ -11,6 +11,7 @@
 #include <thread>
 #include <chrono>
 #include <sstream>
+#include <memory>
 #include <fstream>
 #include <vector>
 
@@ -334,7 +335,11 @@ struct DPNode {
 #ifndef SZ_DP_NO_NORM
 #define SZ_DP_NO_NORM 0
 #endif
-constexpr uint32_t kDPBeam = 8;
+#ifndef SZ_ABEAM
+#define SZ_ABEAM 8
+#endif
+constexpr uint32_t kDPBeam = SZ_ABEAM;
+constexpr uint32_t kBeamSlots = 32; // allocation stride (>= any beam_cap)
 double plan_cost_estimate = 0;
 
 // lengths whose tokens are evaluated as match edges
@@ -372,21 +377,33 @@ static void collect_lens(uint32_t max_len, uint32_t rank,
 // Match candidates depend only on (src, pos): build once, share across all
 // planning passes and both modes. Canonical insertion order (positions 0..n-1)
 // makes the finder deterministic and cacheable.
+#ifndef SZ_CANDW
+#define SZ_CANDW 24 // finder cache width (match candidates per position)
+#endif
+#ifndef SZ_PASSES
+#define SZ_PASSES 6 // DP parse passes (pass 1 online, rest exact-along-plan)
+#endif
+#ifndef SZ_GBEAM
+#define SZ_GBEAM 32 // DP beam width for the guided passes
+#endif
+#ifndef SZ_MCAND
+#define SZ_MCAND 12 // match candidates offered to the parse
+#endif
 struct CandCache {
   std::vector<uint8_t> cnt;
-  std::vector<Match> m; // 8 per position
+  std::vector<Match> m; // SZ_CANDW per position
 };
 static void build_cand_cache(const uint8_t *src, uint32_t n, CandCache &cc) {
   cc.cnt.assign(n, 0);
-  cc.m.assign((size_t)n * 8, Match{0, 0});
+  cc.m.assign((size_t)n * SZ_CANDW, Match{0, 0});
   MatchFinder mf;
   mf.prepare(n);
   for (uint32_t pos = 0; pos < n; ++pos) {
     mf.insert(src, n, pos);
-    Match tmp[8];
-    const uint32_t k = mf.find_multi(src, n, pos, tmp, 8);
+    Match tmp[SZ_CANDW];
+    const uint32_t k = mf.find_multi(src, n, pos, tmp, SZ_CANDW);
     cc.cnt[pos] = (uint8_t)k;
-    for (uint32_t i = 0; i < k; ++i) cc.m[(size_t)pos * 8 + i] = tmp[i];
+    for (uint32_t i = 0; i < k; ++i) cc.m[(size_t)pos * SZ_CANDW + i] = tmp[i];
   }
 }
 
@@ -422,13 +439,16 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
   }
 
   Model ms;                 // online-calibrated price model
-  MixLit mix(mode);         // live literal prices (unguided pass only)
+  std::unique_ptr<MixLit> mix; // live literal prices (unguided pass only)
+  if (!guide) mix.reset(new MixLit(mode));
   Hist hist;
 
   std::vector<DPNode> pool;
   pool.reserve((size_t)n * 6 + 64);
+  std::vector<uint32_t> free_nodes;
+  free_nodes.reserve(256);
   std::vector<uint32_t> best_cnt(n + 1, 0);
-  std::vector<uint32_t> best_slot((size_t)(n + 1) * kDPBeam, 0);
+  std::vector<uint32_t> best_slot((size_t)(n + 1) * kBeamSlots, 0);
 
   DPNode start;
   start.cost = 0;
@@ -439,32 +459,50 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
   best_slot[0] = 0;
   best_cnt[0] = 1;
 
-  const uint32_t beam_cap = g_parse_fast ? 4u : kDPBeam;
+  const uint32_t beam_cap =
+      g_parse_fast ? 4u
+      : (guide ? ((uint32_t)SZ_GBEAM < kBeamSlots ? (uint32_t)SZ_GBEAM
+                                               : kBeamSlots)
+               : kDPBeam);
+  // Recycle nodes dropped from a best list (replaced or evicted): such nodes
+  // are provably never prev-ancestors of anything (lists freeze before their
+  // position is processed), so reuse is exact.
+  auto new_node = [&](const DPNode &nd) -> uint32_t {
+    if (!free_nodes.empty()) {
+      const uint32_t idx = free_nodes.back();
+      free_nodes.pop_back();
+      pool[idx] = nd;
+      return idx;
+    }
+    pool.push_back(nd);
+    return (uint32_t)(pool.size() - 1);
+  };
   auto try_insert = [&](uint32_t q, const DPNode &nd) {
-    uint32_t *lst = &best_slot[(size_t)q * kDPBeam];
+    uint32_t *lst = &best_slot[(size_t)q * kBeamSlots];
     uint32_t &cnt = best_cnt[q];
     for (uint32_t i = 0; i < cnt; ++i) {
-      const DPNode &o = pool[lst[i]];
+      const uint32_t old = lst[i];
+      const DPNode &o = pool[old];
       if (o.reps[0] == nd.reps[0] && o.reps[1] == nd.reps[1] &&
           o.reps[2] == nd.reps[2]) {
         if (nd.cost < o.cost) {
-          pool.push_back(nd);
-          lst[i] = (uint32_t)(pool.size() - 1);
+          lst[i] = new_node(nd);
+          free_nodes.push_back(old);
         }
         return;
       }
     }
     if (cnt < beam_cap) {
-      pool.push_back(nd);
-      lst[cnt++] = (uint32_t)(pool.size() - 1);
+      lst[cnt++] = new_node(nd);
       return;
     }
     uint32_t worst = 0;
     for (uint32_t i = 1; i < cnt; ++i)
       if (pool[lst[i]].cost > pool[lst[worst]].cost) worst = i;
     if (nd.cost < pool[lst[worst]].cost) {
-      pool.push_back(nd);
-      lst[worst] = (uint32_t)(pool.size() - 1);
+      const uint32_t old = lst[worst];
+      lst[worst] = new_node(nd);
+      free_nodes.push_back(old);
     }
   };
 
@@ -487,9 +525,9 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
       }
       mb = (uint8_t)((pos >= greps0[pos]) ? src[pos - greps0[pos]] : 0);
     } else {
-      uint32_t lead = best_slot[(size_t)pos * kDPBeam];
+      uint32_t lead = best_slot[(size_t)pos * kBeamSlots];
       for (uint32_t i = 0; i < best_cnt[pos]; ++i) {
-        uint32_t idx = best_slot[(size_t)pos * kDPBeam + i];
+        uint32_t idx = best_slot[(size_t)pos * kBeamSlots + i];
         if (pool[idx].cost < pool[lead].cost) lead = idx;
       }
       const DPNode &L = pool[lead];
@@ -505,25 +543,22 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
     if (guide) {
       litp = litp_cache[pos]; // exact price cached by the unguided pass
     } else {
-      litp = mix.peek(hist, src[pos], mb, st);
+      litp = mix->peek(hist, src[pos], mb, st);
       litp_cache[pos] = litp;
     }
 #if SZ_STATS
     plan_cost_estimate += (double)litp; // debug: sum of literal prices
 #endif
-#ifndef SZ_MCAND
-#define SZ_MCAND 8
-#endif
-    Match cands[8];
+    Match cands[16];
     const uint32_t mcc = g_parse_fast ? 6u : (uint32_t)SZ_MCAND;
     const uint32_t ncand = SZ_DP_NO_NORM ? 0u : cc.cnt[pos];
     for (uint32_t i = 0; i < ncand && i < mcc; ++i)
-      cands[i] = cc.m[(size_t)pos * 8 + i];
+      cands[i] = cc.m[(size_t)pos * SZ_CANDW + i];
 
     // ms is constant within a position: pre-price every length and every
     // candidate distance ONCE instead of per (arrival, candidate, length).
     // Only price the lengths this position can actually offer.
-    uint32_t norm_prefix[8];
+    uint32_t norm_prefix[16];
     uint32_t max_need = kMinMatch;
     for (uint32_t ci = 0; ci < ncand && ci < mcc; ++ci) {
       norm_prefix[ci] = price_bit(ms.is_match, 1) + price_bit(ms.is_rep, 0) +
@@ -538,7 +573,7 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
       lenp[l] = price_gamma_p(ms.len_unary, ms.len_bits, l - 2);
 
     for (uint32_t bi = 0; bi < best_cnt[pos]; ++bi) {
-      uint32_t idx = best_slot[(size_t)pos * kDPBeam + bi];
+      uint32_t idx = best_slot[(size_t)pos * kBeamSlots + bi];
       const DPNode A = pool[idx]; // copy: try_insert may realloc pool
 
       // literal edge (guided pass prices the is_match=0 bit too: exact there)
@@ -599,11 +634,15 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
     }
 
     // advance the raw-prefix model after pricing this position (unguided only)
-    if (!guide) mix.train_byte(hist, src[pos], mb, st);
+    if (!guide) mix->train_byte(hist, src[pos], mb, st);
   }
 
+#if SZ_STATS
+  fprintf(stderr, "[pool] mode=%u guide=%d n=%u pool=%zu cap=%zu\n",
+          mode, guide ? 1 : 0, n, pool.size(), pool.capacity());
+#endif
   // reconstruct the cheapest full-coverage path
-  const uint32_t *fin = &best_slot[(size_t)n * kDPBeam];
+  const uint32_t *fin = &best_slot[(size_t)n * kBeamSlots];
   const uint32_t fin_cnt = best_cnt[n];
   if (fin_cnt == 0) {
     // unreachable in practice; fall back to all-literals
@@ -739,11 +778,11 @@ static bool same_plan(const std::vector<PlanTok> &a,
 static void encode_one_mode(const uint8_t *src, uint32_t n, uint32_t mode,
                             const CandCache &cc, std::vector<uint8_t> &out) {
   std::vector<uint32_t> litp_cache(n, 0);
-  std::vector<PlanTok> plans[4];
+  std::vector<PlanTok> plans[8];
   SZ_TIC(t0);
   plan_block_pass(src, n, plans[0], nullptr, mode, cc, litp_cache);
   size_t nplans = 1;
-  for (size_t k = 1; k < 4; ++k) {
+  for (size_t k = 1; k < (size_t)SZ_PASSES; ++k) {
     plan_block_pass(src, n, plans[k], &plans[k - 1], mode, cc, litp_cache);
     nplans = k + 1;
     if (same_plan(plans[k], plans[k - 1])) break; // converged: later passes repeat

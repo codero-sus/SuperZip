@@ -287,6 +287,18 @@ int run_gui(unsigned short port) {
   std::printf("G0D SZIP GUI: http://localhost:%u  (Ctrl+C to stop)\n",
               (unsigned)port);
   std::fflush(stdout);
+  // best-effort browser open (the GUI is the default entry point)
+  {
+    const std::string url = "http://localhost:" + std::to_string(port);
+#ifdef _WIN32
+    std::string cmd = "start \"\" " + url;
+#elif defined(__APPLE__)
+    std::string cmd = "open " + url;
+#else
+    std::string cmd = "xdg-open " + url + " >/dev/null 2>&1 &";
+#endif
+    std::thread([cmd]() { (void)std::system(cmd.c_str()); }).detach();
+  }
   for (;;) {
     sockaddr_in ca;
 #ifdef _WIN32
