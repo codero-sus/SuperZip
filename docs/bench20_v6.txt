@@ -1,0 +1,188 @@
+G0D SZIP — universe benchmark  (single-run wall times, indicative)
+compressors found: 5
+
+=== code  (70,592 B) ===
+  g0dszip (best)                      17,044 B   24.14%  c  34.82s  d   0.60s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   17,044 B   24.14%  c  32.94s  d   0.60s  roundtrip ok <-- G0D
+  xz -9e                              17,640 B   24.99%  c   0.12s  d   0.02s  roundtrip ok
+  bzip2 -9                            18,214 B   25.80%  c   0.02s  d   0.03s  roundtrip ok
+  gzip -9                             19,282 B   27.31%  c   0.02s  d   0.02s  roundtrip ok
+  -> vs best alternative (xz -9e 17,640 B): WIN by 3.38%
+
+=== text  (500,003 B) ===
+  g0dszip (best)                      52,732 B   10.55%  c 145.13s  d   1.00s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   52,732 B   10.55%  c 129.78s  d   0.64s  roundtrip ok <-- G0D
+  bzip2 -9                            53,954 B   10.79%  c   0.11s  d   0.12s  roundtrip ok
+  xz -9e                              76,764 B   15.35%  c   0.31s  d   0.04s  roundtrip ok
+  gzip -9                             86,539 B   17.31%  c   0.10s  d   0.03s  roundtrip ok
+  -> vs best alternative (bzip2 -9 53,954 B): WIN by 2.26%
+
+=== rand  (500,000 B) ===
+  g0dszip (best)                     500,004 B  100.00%  c  50.38s  d   0.02s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                  500,004 B  100.00%  c  48.02s  d   0.02s  roundtrip ok <-- G0D
+  xz -9e                             500,084 B  100.02%  c   0.30s  d   0.03s  roundtrip ok
+  gzip -9                            500,107 B  100.02%  c   0.03s  d   0.04s  roundtrip ok
+  bzip2 -9                           502,695 B  100.54%  c   0.17s  d   0.11s  roundtrip ok
+  -> vs best alternative (xz -9e 500,084 B): WIN by 0.02%
+
+=== src  (277,530 B) ===
+  g0dszip (best)                      51,343 B   18.50%  c  58.09s  d   0.62s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   51,343 B   18.50%  c  58.38s  d   0.39s  roundtrip ok <-- G0D
+  xz -9e                              51,796 B   18.66%  c   0.19s  d   0.03s  roundtrip ok
+  bzip2 -9                            65,288 B   23.52%  c   0.07s  d   0.04s  roundtrip ok
+  gzip -9                             76,747 B   27.65%  c   0.07s  d   0.03s  roundtrip ok
+  -> vs best alternative (xz -9e 51,796 B): WIN by 0.87%
+
+=== b64  (131,072 B) ===
+  g0dszip (best)                      24,430 B   18.64%  c  30.42s  d   0.44s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   24,430 B   18.64%  c  30.10s  d   0.37s  roundtrip ok <-- G0D
+  bzip2 -9                            25,452 B   19.42%  c   0.04s  d   0.03s  roundtrip ok
+  xz -9e                              32,988 B   25.17%  c   0.14s  d   0.02s  roundtrip ok
+  gzip -9                             36,886 B   28.14%  c   0.06s  d   0.02s  roundtrip ok
+  -> vs best alternative (bzip2 -9 25,452 B): WIN by 4.02%
+
+=== binary  (131,072 B) ===
+  g0dszip (best)                      64,289 B   49.05%  c  25.62s  d   0.43s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   64,289 B   49.05%  c  26.30s  d   0.55s  roundtrip ok <-- G0D
+  xz -9e                              65,172 B   49.72%  c   0.19s  d   0.02s  roundtrip ok
+  bzip2 -9                            67,809 B   51.73%  c   0.04s  d   0.03s  roundtrip ok
+  gzip -9                             69,440 B   52.98%  c   0.12s  d   0.03s  roundtrip ok
+  -> vs best alternative (xz -9e 65,172 B): WIN by 1.35%
+
+=== csv  (131,072 B) ===
+  g0dszip (best)                      32,624 B   24.89%  c  28.76s  d   0.44s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   32,624 B   24.89%  c  28.67s  d   0.39s  roundtrip ok <-- G0D
+  bzip2 -9                            34,309 B   26.18%  c   0.04s  d   0.03s  roundtrip ok
+  xz -9e                              41,676 B   31.80%  c   0.12s  d   0.02s  roundtrip ok
+  gzip -9                             47,704 B   36.40%  c   0.07s  d   0.02s  roundtrip ok
+  -> vs best alternative (bzip2 -9 34,309 B): WIN by 4.91%
+
+=== dict  (131,072 B) ===
+  g0dszip (best)                      33,354 B   25.45%  c  26.24s  d   0.39s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   33,354 B   25.45%  c  27.81s  d   0.57s  roundtrip ok <-- G0D
+  xz -9e                              36,660 B   27.97%  c   0.12s  d   0.03s  roundtrip ok
+  bzip2 -9                            41,951 B   32.01%  c   0.04s  d   0.03s  roundtrip ok
+  gzip -9                             53,651 B   40.93%  c   0.03s  d   0.03s  roundtrip ok
+  -> vs best alternative (xz -9e 36,660 B): WIN by 9.02%
+
+=== dna  (131,072 B) ===
+  g0dszip (best)                      19,028 B   14.52%  c  31.77s  d   0.46s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   19,028 B   14.52%  c  32.73s  d   0.39s  roundtrip ok <-- G0D
+  bzip2 -9                            20,218 B   15.43%  c   0.04s  d   0.03s  roundtrip ok
+  xz -9e                              21,732 B   16.58%  c   0.13s  d   0.02s  roundtrip ok
+  gzip -9                             23,602 B   18.01%  c   0.13s  d   0.03s  roundtrip ok
+  -> vs best alternative (bzip2 -9 20,218 B): WIN by 5.89%
+
+=== floats  (131,072 B) ===
+  xz -9e                              84,992 B   64.84%  c   0.14s  d   0.01s  roundtrip ok
+  g0dszip (best)                      93,359 B   71.23%  c  22.48s  d   0.58s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   93,359 B   71.23%  c  22.36s  d   0.62s  roundtrip ok <-- G0D
+  gzip -9                             99,781 B   76.13%  c   0.04s  d   0.01s  roundtrip ok
+  bzip2 -9                           100,734 B   76.85%  c   0.05s  d   0.04s  roundtrip ok
+  -> vs best alternative (xz -9e 84,992 B): behind by 9.84%
+
+=== hex  (131,072 B) ===
+  g0dszip (best)                      34,266 B   26.14%  c  30.49s  d   0.34s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   34,266 B   26.14%  c  31.32s  d   0.31s  roundtrip ok <-- G0D
+  bzip2 -9                            37,114 B   28.32%  c   0.04s  d   0.03s  roundtrip ok
+  xz -9e                              41,564 B   31.71%  c   0.17s  d   0.01s  roundtrip ok
+  gzip -9                             47,547 B   36.28%  c   0.10s  d   0.03s  roundtrip ok
+  -> vs best alternative (bzip2 -9 37,114 B): WIN by 7.67%
+
+=== html  (131,072 B) ===
+  bzip2 -9                            12,036 B    9.18%  c   0.04s  d   0.03s  roundtrip ok
+  g0dszip (best)                      12,038 B    9.18%  c  46.52s  d   0.37s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   12,038 B    9.18%  c  47.27s  d   0.38s  roundtrip ok <-- G0D
+  xz -9e                              15,252 B   11.64%  c   0.14s  d   0.02s  roundtrip ok
+  gzip -9                             16,919 B   12.91%  c   0.03s  d   0.03s  roundtrip ok
+  -> vs best alternative (bzip2 -9 12,036 B): behind by 0.02%
+
+=== json  (131,072 B) ===
+  g0dszip (best)                      10,775 B    8.22%  c  35.87s  d   0.44s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   10,775 B    8.22%  c  37.68s  d   0.41s  roundtrip ok <-- G0D
+  bzip2 -9                            11,133 B    8.49%  c   0.04s  d   0.02s  roundtrip ok
+  xz -9e                              13,156 B   10.04%  c   0.13s  d   0.03s  roundtrip ok
+  gzip -9                             16,313 B   12.45%  c   0.05s  d   0.03s  roundtrip ok
+  -> vs best alternative (bzip2 -9 11,133 B): WIN by 3.22%
+
+=== log  (131,072 B) ===
+  g0dszip (best)                       8,940 B    6.82%  c  42.54s  d   0.53s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                    8,940 B    6.82%  c  42.69s  d   0.34s  roundtrip ok <-- G0D
+  bzip2 -9                             8,948 B    6.83%  c   0.04s  d   0.02s  roundtrip ok
+  xz -9e                              11,172 B    8.52%  c   0.11s  d   0.02s  roundtrip ok
+  gzip -9                             13,495 B   10.30%  c   0.03s  d   0.02s  roundtrip ok
+  -> vs best alternative (bzip2 -9 8,948 B): WIN by 0.09%
+
+=== mixed  (131,072 B) ===
+  g0dszip (best)                      51,580 B   39.35%  c  27.79s  d   0.72s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   51,580 B   39.35%  c  26.90s  d   0.41s  roundtrip ok <-- G0D
+  xz -9e                              53,240 B   40.62%  c   0.17s  d   0.01s  roundtrip ok
+  bzip2 -9                            56,973 B   43.47%  c   0.04s  d   0.03s  roundtrip ok
+  gzip -9                             61,722 B   47.09%  c   0.04s  d   0.02s  roundtrip ok
+  -> vs best alternative (xz -9e 53,240 B): WIN by 3.12%
+
+=== pcm  (131,072 B) ===
+  g0dszip (best)                     101,896 B   77.74%  c  20.98s  d   0.61s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                  101,896 B   77.74%  c  22.53s  d   0.57s  roundtrip ok <-- G0D
+  bzip2 -9                           122,971 B   93.82%  c   0.05s  d   0.03s  roundtrip ok
+  xz -9e                             124,512 B   95.00%  c   0.16s  d   0.03s  roundtrip ok
+  gzip -9                            127,322 B   97.14%  c   0.03s  d   0.02s  roundtrip ok
+  -> vs best alternative (bzip2 -9 122,971 B): WIN by 17.14%
+
+=== prose  (131,072 B) ===
+  g0dszip (best)                      26,431 B   20.17%  c  29.32s  d   0.50s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   26,431 B   20.17%  c  33.11s  d   0.51s  roundtrip ok <-- G0D
+  bzip2 -9                            28,427 B   21.69%  c   0.03s  d   0.03s  roundtrip ok
+  xz -9e                              33,292 B   25.40%  c   0.14s  d   0.02s  roundtrip ok
+  gzip -9                             36,679 B   27.98%  c   0.13s  d   0.03s  roundtrip ok
+  -> vs best alternative (bzip2 -9 28,427 B): WIN by 7.02%
+
+=== sparse  (131,072 B) ===
+  g0dszip (best)                         873 B    0.67%  c 402.84s  d   0.49s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                      873 B    0.67%  c 333.54s  d   0.23s  roundtrip ok <-- G0D
+  xz -9e                                 912 B    0.70%  c   0.02s  d   0.01s  roundtrip ok
+  bzip2 -9                             1,020 B    0.78%  c   0.01s  d   0.01s  roundtrip ok
+  gzip -9                              1,034 B    0.79%  c   0.01s  d   0.01s  roundtrip ok
+  -> vs best alternative (xz -9e 912 B): WIN by 4.28%
+
+=== utf8  (131,072 B) ===
+  g0dszip (best)                      14,786 B   11.28%  c  18.53s  d   0.30s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   14,786 B   11.28%  c  18.51s  d   0.26s  roundtrip ok <-- G0D
+  bzip2 -9                            14,981 B   11.43%  c   0.01s  d   0.01s  roundtrip ok
+  xz -9e                              21,212 B   16.18%  c   0.05s  d   0.01s  roundtrip ok
+  gzip -9                             23,091 B   17.62%  c   0.02s  d   0.00s  roundtrip ok
+  -> vs best alternative (bzip2 -9 14,981 B): WIN by 1.30%
+
+=== xml  (131,072 B) ===
+  bzip2 -9                            13,835 B   10.56%  c   0.02s  d   0.01s  roundtrip ok
+  g0dszip (best)                      13,937 B   10.63%  c  19.60s  d   0.24s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   13,937 B   10.63%  c  20.77s  d   0.26s  roundtrip ok <-- G0D
+  xz -9e                              17,768 B   13.56%  c   0.05s  d   0.01s  roundtrip ok
+  gzip -9                             20,903 B   15.95%  c   0.01s  d   0.01s  roundtrip ok
+  -> vs best alternative (bzip2 -9 13,835 B): behind by 0.74%
+
+=== universe verdict ===
+  code  WIN  vs xz -9e  (+3.38%)
+  text  WIN  vs bzip2 -9  (+2.26%)
+  rand  WIN  vs xz -9e  (+0.02%)
+  src   WIN  vs xz -9e  (+0.87%)
+  b64   WIN  vs bzip2 -9  (+4.02%)
+  binary WIN  vs xz -9e  (+1.35%)
+  csv   WIN  vs bzip2 -9  (+4.91%)
+  dict  WIN  vs xz -9e  (+9.02%)
+  dna   WIN  vs bzip2 -9  (+5.89%)
+  floats LOSS  vs xz -9e  (-9.84%)
+  hex   WIN  vs bzip2 -9  (+7.67%)
+  html  LOSS  vs bzip2 -9  (-0.02%)
+  json  WIN  vs bzip2 -9  (+3.22%)
+  log   WIN  vs bzip2 -9  (+0.09%)
+  mixed WIN  vs xz -9e  (+3.12%)
+  pcm   WIN  vs bzip2 -9  (+17.14%)
+  prose WIN  vs bzip2 -9  (+7.02%)
+  sparse WIN  vs xz -9e  (+4.28%)
+  utf8  WIN  vs bzip2 -9  (+1.30%)
+  xml   LOSS  vs bzip2 -9  (-0.74%)
+
+  17/20 first places
+  note: zstd/brotli/lz4/snappy need build/venv (sh tests/benchall.sh);
+        extensible codec IDs in .szip v5 leave room for more models.

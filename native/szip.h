@@ -22,11 +22,12 @@ extern "C" {
 #define SZIP_ERR_BUFFER (-7)
 
 /* Container constants. */
-#define SZIP_VERSION 5
+#define SZIP_VERSION 6
 #define SZIP_MAGIC0 0x53 /* 'S' */
 #define SZIP_MAGIC1 0x5A /* 'Z' */
 #define SZIP_MAGIC2 0x50 /* 'P' */
 #define SZIP_MAGIC3 0x31 /* '1' */
+#define SZIP_BARE_FLAG 0x80 /* magic[3] high bit: bare stored form (v6+) */
 #define SZIP_HEADER_SIZE 20
 #define SZIP_FOOTER_SIZE 8
 #define SZIP_BLOCK_HEADER_SIZE 10

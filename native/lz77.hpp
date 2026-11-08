@@ -17,7 +17,7 @@ constexpr uint32_t kWindow = 1u << kWindowLog;
 constexpr uint32_t kHashBits = 18;
 constexpr uint32_t kHashSize = 1u << kHashBits;
 #ifndef SZ_CHAIN
-#define SZ_CHAIN 400
+#define SZ_CHAIN 160
 #endif
 #ifndef SZ_NICE
 #define SZ_NICE 128
@@ -128,7 +128,8 @@ public:
       if (len > all[longest_i].len) longest_i = cnt;
       if (off < all[nearest_i].off) nearest_i = cnt;
       ++cnt;
-      if ((len >= kNiceLen || len == max_len) && cnt >= kmax) break;
+      if (len == max_len && cnt >= 4) break; // full-length: diversity is done
+      if (len >= kNiceLen && cnt >= kmax) break;
       cand = prev_[mpos % prev_.size()];
     }
     if (cnt == 0) return 0;

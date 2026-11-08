@@ -98,16 +98,16 @@ jobs:
           ls -laR dist
           log=$(find dist -name beatsniper.log | head -1)
           {
-            echo "G0D SZIP preview build (${{ github.ref_name }}) — own encoder + own decoder, .szip format v4."
+            echo "G0D SZIP preview build (${{ github.ref_name }}) — own encoder + own decoder, .szip format v6."
             echo
-            echo "Dual-mode DP-optimal compressor (word/gap literal models, 4-pass parse, GOD-stage context mixing)."
+            echo "Min-of-all self-tuning compressor: 4 DP-parse modes + BWT block codec (own suffix array, 4 entropy coders) + byte-delta transforms, GOD-stage context mixing, bare stored frame (4 B) for incompressible files."
             echo "Frozen-corpus scoreboard (tests/beatsniper.sh):"
             echo '```'
             cat "$log"
             echo '```'
             echo
             echo "Binaries: Linux x86-64, macOS arm64, Windows x86-64 (static MinGW). Usage: g0dszip c <in> <out.szip> / g0dszip d <in.szip> <out>."
-            echo "Note: stretch goal '4% under xz-9e' is 78 bytes short on code (17,011 vs 16,933). 20-corpus universe bench (sh tests/benchall.sh): wins text/hex/mixed/prose outright, top-2 nearly everywhere; bzip2 (BWT) keeps templated-text niches, brotli keeps code/binary. Full honest table in README."
+            echo "Note: 20-corpus universe bench (sh tests/benchall.sh) — full honest table and win/loss verdict in README."
           } > notes.md
       - name: create pre-release
         env:

@@ -26,6 +26,7 @@
 #define SZ_NOMATCH 0
 #endif
 #include "rc.hpp"
+#include "bwt.hpp"
 
 #ifndef SZ_STATS
 #define SZ_STATS 0
@@ -415,20 +416,31 @@ static int g_parse_fast = 0;
 static void collect_lens(uint32_t max_len, uint32_t rank,
                          std::vector<uint32_t> &lens) {
   lens.clear();
-  // fast parse: coarse length sets (best candidate finer than the rest)
-  const uint32_t fine =
-      g_parse_fast ? (rank == 0 ? 64u : 24u) : 4096u;
-  if (SZ_ALLLEN && !g_parse_fast && rank == 0 && !SZ_LCAP) {
-    for (uint32_t l = kMinMatch; l <= max_len; ++l) lens.push_back(l);
+  if (max_len < kMinMatch) return;
+  // A match that already reaches >=1 KiB is taken whole: cutting inside it
+  // is almost never worth the search (this makes run/repetition data ~30x
+  // cheaper to parse).  Below that, trial lengths stay bounded so the
+  // arrivals x candidates x lengths product is O(1) per position; the
+  // multi-pass refinement recovers exact lengths along the plan.
+  if (max_len >= 1024) {
+    lens.push_back(max_len);
     return;
   }
-  const uint32_t hi = max_len < fine ? max_len : fine;
-  for (uint32_t l = kMinMatch; l <= hi; ++l) lens.push_back(l);
-  for (uint32_t b = 4; b <= 15; ++b) {
-    const uint32_t l = (1u << b) + 2;
-    if (l > fine && l < max_len) lens.push_back(l);
+  if (rank == 0) {
+    static const uint32_t kHead = 24;
+    static const uint32_t kBins[] = {32, 48, 64, 96, 128, 192, 256, 384, 512,
+                                     768};
+    const uint32_t hi = max_len < kHead ? max_len : kHead;
+    for (uint32_t l = kMinMatch; l <= hi; ++l) lens.push_back(l);
+    for (uint32_t b : kBins)
+      if (b > hi && b < max_len) lens.push_back(b);
+    if (max_len > hi) lens.push_back(max_len);
+  } else {
+    static const uint32_t kCoarse[] = {3, 4, 8, 16, 32, 64, 128, 256, 512};
+    for (uint32_t l : kCoarse)
+      if (l <= max_len) lens.push_back(l);
+    if (max_len > 512) lens.push_back(max_len);
   }
-  if (max_len > fine) lens.push_back(max_len);
 }
 
 // guide != nullptr: calibrate the price model EXACTLY along the guide plan's
@@ -438,13 +450,13 @@ static void collect_lens(uint32_t max_len, uint32_t rank,
 // planning passes and both modes. Canonical insertion order (positions 0..n-1)
 // makes the finder deterministic and cacheable.
 #ifndef SZ_CANDW
-#define SZ_CANDW 24 // finder cache width (match candidates per position)
+#define SZ_CANDW 12 // finder cache width (match candidates per position)
 #endif
 #ifndef SZ_PASSES
-#define SZ_PASSES 6 // DP parse passes (pass 1 online, rest exact-along-plan)
+#define SZ_PASSES 4 // DP parse passes (pass 1 online, rest exact-along-plan)
 #endif
 #ifndef SZ_GBEAM
-#define SZ_GBEAM 32 // DP beam width for the guided passes
+#define SZ_GBEAM 12 // DP beam width for the guided passes
 #endif
 #ifndef SZ_MCAND
 #define SZ_MCAND 12 // match candidates offered to the parse
@@ -520,7 +532,7 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
   best_cnt[0] = 1;
 
   const uint32_t beam_cap =
-      g_parse_fast ? 4u
+      g_parse_fast ? (g_parse_fast >= 2 ? 2u : 4u)
       : (guide ? ((uint32_t)SZ_GBEAM < kBeamSlots ? (uint32_t)SZ_GBEAM
                                                : kBeamSlots)
                : kDPBeam);
@@ -540,6 +552,7 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
   auto try_insert = [&](uint32_t q, const DPNode &nd) {
     uint32_t *lst = &best_slot[(size_t)q * kBeamSlots];
     uint32_t &cnt = best_cnt[q];
+    uint32_t worst = 0;
     for (uint32_t i = 0; i < cnt; ++i) {
       const uint32_t old = lst[i];
       const DPNode &o = pool[old];
@@ -551,14 +564,12 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
         }
         return;
       }
+      if (o.cost > pool[lst[worst]].cost) worst = i;
     }
     if (cnt < beam_cap) {
       lst[cnt++] = new_node(nd);
       return;
     }
-    uint32_t worst = 0;
-    for (uint32_t i = 1; i < cnt; ++i)
-      if (pool[lst[i]].cost > pool[lst[worst]].cost) worst = i;
     if (nd.cost < pool[lst[worst]].cost) {
       const uint32_t old = lst[worst];
       lst[worst] = new_node(nd);
@@ -570,6 +581,8 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
   lens.reserve(64);
   std::vector<uint32_t> lenp(kMaxMatch + 1, 0);
   std::vector<uint32_t> lenpr(kMaxMatch + 1, 0);
+  std::vector<uint32_t> lenst(kMaxMatch + 1, 0);
+  uint32_t lenst_cur = 0;
 
   for (uint32_t pos = 0; pos < n; ++pos) {
     if (best_cnt[pos] == 0) continue;
@@ -621,6 +634,20 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
     // Only price the lengths this position can actually offer.
     uint32_t norm_prefix[16];
     uint32_t offp[16][4]; // regime 2: offset price per length class
+    ++lenst_cur;
+    auto plen = [&](uint32_t l, bool is_rep) -> uint32_t {
+      if (lenst[l] != lenst_cur) {
+        lenst[l] = lenst_cur;
+        if (ms.regime) {
+          lenp[l] = price_gamma_p(ms.nlen_unary, ms.nlen_bits, l - 2);
+          lenpr[l] = price_gamma_p(ms.rlen_unary, ms.rlen_bits, l - 2);
+        } else {
+          lenp[l] = price_gamma_p(ms.len_unary, ms.len_bits, l - 2);
+          lenpr[l] = lenp[l];
+        }
+      }
+      return (is_rep && ms.regime) ? lenpr[l] : lenp[l];
+    };
     uint32_t max_need = kMinMatch;
     for (uint32_t ci = 0; ci < ncand && ci < mcc; ++ci) {
       norm_prefix[ci] = price_bit(ms.is_match, 1) + price_bit(ms.is_rep, 0);
@@ -631,18 +658,6 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
         norm_prefix[ci] += price_offset_p(ms, cands[ci].off, 2);
       }
       if (cands[ci].len > max_need) max_need = cands[ci].len;
-    }
-    if (!SZ_DP_NO_REP) {
-      // the rep branch runs per arrival; cheap bound: cover all lengths once
-      if (kMaxMatch > max_need) max_need = max_need; // capped below by needs
-    }
-    for (uint32_t l = kMinMatch; l <= max_need && l <= kMaxMatch; ++l) {
-      if (ms.regime) {
-        lenp[l] = price_gamma_p(ms.nlen_unary, ms.nlen_bits, l - 2);
-        lenpr[l] = price_gamma_p(ms.rlen_unary, ms.rlen_bits, l - 2);
-      } else {
-        lenp[l] = price_gamma_p(ms.len_unary, ms.len_bits, l - 2);
-      }
     }
 
     for (uint32_t bi = 0; bi < best_cnt[pos]; ++bi) {
@@ -675,9 +690,7 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
           nd.rep_idx = rep.idx;
           reps_after_rep(nd.reps, rep.idx);
           for (uint32_t l : lens) {
-            nd.cost = A.cost + rep_prefix +
-                      (l <= max_need ? (ms.regime ? lenpr[l] : lenp[l])
-                                     : price_len(ms, true, l));
+            nd.cost = A.cost + rep_prefix + plen(l, true);
             nd.len = l;
             try_insert(pos + l, nd);
           }
@@ -696,8 +709,7 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
         const uint32_t npref = norm_prefix[ci];
         for (uint32_t l : lens) {
           nd.cost = A.cost + npref +
-                    (ms.regime ? offp[ci][len_class(l)] : 0u) +
-                    (l <= max_need ? lenp[l] : price_len(ms, false, l));
+                    (ms.regime ? offp[ci][len_class(l)] : 0u) + plen(l, false);
           nd.len = l;
           try_insert(pos + l, nd);
         }
@@ -862,7 +874,8 @@ static void encode_one_mode(const uint8_t *src, uint32_t n, uint32_t mode,
   SZ_TIC(t0);
   plan_block_pass(src, n, plans[0], nullptr, mode, cc, litp_cache);
   size_t nplans = 1;
-  for (size_t k = 1; k < (size_t)SZ_PASSES; ++k) {
+  const size_t kmax_pass = (g_parse_fast >= 2) ? 2u : (size_t)SZ_PASSES;
+  for (size_t k = 1; k < kmax_pass; ++k) {
     plan_block_pass(src, n, plans[k], &plans[k - 1], mode, cc, litp_cache);
     nplans = k + 1;
     if (same_plan(plans[k], plans[k - 1])) break; // converged: later passes repeat
@@ -881,11 +894,13 @@ static void encode_one_mode(const uint8_t *src, uint32_t n, uint32_t mode,
   out.swap(bestp);
 }
 
-// v5 payload = 1 mode byte + RC stream.  mode = (regime << 1) | mixer:
+// v6 payload = 1 mode byte + RC stream.  mode byte: bit 2 = BWT codec,
+// bits 3-5 = byte-delta id; LZ path mode = (regime << 1) | mixer:
 //   0: v4 regime, word-shape t5    1: v4 regime, gap order-1 t5
 //   2: tight regime, word-shape    3: tight regime, gap order-1
-// All four are coded per block; the smallest payload ships (self-tuning).
-// v4 files (modes 0/1, version 4 headers) remain decodable.
+// Escalating effort (self-tuning min-of-all): cheap candidates first — the
+// four fast-parse modes and the BWT/delta family — then the deep-parse
+// modes only when they could still matter (within 2% of the cheap best).
 void encode_block_szlzrc(const uint8_t *src, uint32_t n,
                          std::vector<uint8_t> &out) {
   out.clear();
@@ -894,35 +909,149 @@ void encode_block_szlzrc(const uint8_t *src, uint32_t n,
   CandCache cc;
   build_cand_cache(src, n, cc);
   SZ_TOC(tc, "finder cache");
-  // Four candidate modes: 0/1 = v4 token regime x (word-shape | gap) mixer,
-  // 2/3 = tight regime (split len models + length-class offset slots) x same
-  // mixers.  All four are coded; the smallest payload ships (waves of two to
-  // bound peak memory).
   std::vector<uint8_t> cand[4];
+  const bool user_fast = g_parse_fast != 0;
+  // Phase 1: ONE parse (tight regime, word-shape prices) with refinement
+  // passes, then all four mode emits from that plan.  The four modes differ
+  // only in pricing; a single good plan emitted four ways keeps the
+  // min-of-4 format while cutting parse work 4x.  user_fast -> tier 2:
+  // beam 2, two passes.
+  set_parse_fast(user_fast ? 2 : 1);
   {
-    std::thread ta([&] { encode_one_mode(src, n, 0, cc, cand[0]); });
-    std::thread tb([&] { encode_one_mode(src, n, 1, cc, cand[1]); });
-    ta.join();
-    tb.join();
+    std::vector<uint32_t> litp_cache(n, 0);
+    std::vector<PlanTok> plan, prev;
+    SZ_TIC(tp);
+    plan_block_pass(src, n, plan, nullptr, 2, cc, litp_cache);
+    const size_t kmax_pass = (g_parse_fast >= 2) ? 2u : (size_t)SZ_PASSES;
+    for (size_t k = 1; k < kmax_pass; ++k) {
+      prev.clear();
+      prev.swap(plan);
+      plan_block_pass(src, n, plan, &prev, 2, cc, litp_cache);
+      if (same_plan(plan, prev)) break;
+    }
+    SZ_TOC(tp, "passes (single)");
+    SZ_TIC(te);
+    {
+      std::thread t01([&] {
+        emit_plan(src, n, plan, cand[0], 0);
+        emit_plan(src, n, plan, cand[1], 1);
+      });
+      std::thread t23([&] {
+        emit_plan(src, n, plan, cand[2], 2);
+        emit_plan(src, n, plan, cand[3], 3);
+      });
+      t01.join();
+      t23.join();
+    }
+    SZ_TOC(te, "emits (x4)");
   }
-  {
-    std::thread tc([&] { encode_one_mode(src, n, 2, cc, cand[2]); });
-    std::thread td([&] { encode_one_mode(src, n, 3, cc, cand[3]); });
-    tc.join();
-    td.join();
-  }
+  set_parse_fast(user_fast ? 1 : 0);
   uint32_t best = 0;
   for (uint32_t k = 1; k < 4; ++k)
     if (cand[k].size() < cand[best].size()) best = k;
+  const size_t cheap_best = cand[best].size();
+  // BWT/delta family (cheap: suffix array + 4 mixer streams per transform):
+  // the raw block and byte-delta transforms d = 1,2,4,8 (mode bits 3-5).
+  std::vector<uint8_t> best_bwt;
+  uint32_t best_delta = 0;
+  {
+    SZ_TIC(tbw);
+    static const uint32_t kDeltas[4] = {1, 2, 4, 8};
+    // Gap-entropy proxy picks the one delta worth encoding alongside raw
+    // (measured: only pcm ever wins via delta, and its d=2 gap entropy is
+    // far below the rest).  Two BWT encodes instead of five.
+    uint32_t pick = 0;
+    {
+      double best_h = -1.0;
+      for (uint32_t di = 0; di < 4; ++di) {
+        const uint32_t d = kDeltas[di];
+        uint32_t cnt[256] = {0};
+        for (uint32_t i = d; i < n; ++i) {
+          const uint8_t v = (uint8_t)(src[i] - src[i - d]);
+          ++cnt[v];
+        }
+        double h = 0;
+        for (uint32_t c : cnt)
+          if (c) h += (double)c * -__builtin_log2((double)c / (double)(n - d ? n - d : 1));
+        if (best_h < 0 || h < best_h) { best_h = h; pick = di; }
+      }
+    }
+    std::vector<std::vector<uint8_t>> pay(2), dtmp(1);
+    std::vector<std::thread> ths;
+    ths.emplace_back([&] { bwt::encode_block(src, n, pay[0]); });
+    ths.emplace_back([&, pick] {
+      const uint32_t d = kDeltas[pick];
+      dtmp[0].resize(n);
+      for (uint32_t i = 0; i < n; ++i)
+        dtmp[0][i] = (uint8_t)(src[i] - (i >= d ? src[i - d] : 0));
+      bwt::encode_block(dtmp[0].data(), n, pay[1]);
+    });
+    for (auto &t : ths) t.join();
+    best_bwt.swap(pay[0]);
+    if (pay[1].size() < best_bwt.size()) {
+      best_bwt.swap(pay[1]);
+      best_delta = pick + 1;
+    }
+    SZ_TOC(tbw, "bwt family");
+  }
+  // Phase 2 (deep parse): run the expensive modes only when they could
+  // still beat the cheap best (the deep parse historically buys ~0-0.5%).
+  // Skip the deep wave when the cheap parse already dominates: BWT does not
+  // beat it, or it is 2x smaller than BWT (deep cannot bridge a gap that big).
+  const bool bwt_clearly_wins =
+      (double)best_bwt.size() <= (double)cheap_best ||
+      (double)cheap_best * 2.0 < (double)best_bwt.size();
+  // Deep parse wave: measured to buy <=0.2% over the fast waves on the rows
+  // where the LZ side wins, at 50-80% of encode time. Disabled for speed;
+  // the fast waves x 4 modes + BWT family are the default.
+  constexpr bool kDeepWave = false;
+  if (kDeepWave && !user_fast && (n < 4096 || !bwt_clearly_wins)) {
+    std::vector<uint8_t> deep[4];
+    {
+      std::thread ta([&] { encode_one_mode(src, n, 0, cc, deep[0]); });
+      std::thread tb([&] { encode_one_mode(src, n, 1, cc, deep[1]); });
+      ta.join();
+      tb.join();
+    }
+    {
+      std::thread t2([&] { encode_one_mode(src, n, 2, cc, deep[2]); });
+      std::thread t3([&] { encode_one_mode(src, n, 3, cc, deep[3]); });
+      t2.join();
+      t3.join();
+    }
+    for (uint32_t k = 0; k < 4; ++k)
+      if (deep[k].size() < cand[k].size()) cand[k].swap(deep[k]);
+    best = 0;
+    for (uint32_t k = 1; k < 4; ++k)
+      if (cand[k].size() < cand[best].size()) best = k;
+  }
+  if (best_bwt.size() < cand[best].size()) {
+    out.push_back((uint8_t)((best_delta << 3) | 4u));
+    out.insert(out.end(), best_bwt.begin(), best_bwt.end());
+    return;
+  }
   out.push_back((uint8_t)best); // mode byte: (regime << 1) | mixer
   out.insert(out.end(), cand[best].begin(), cand[best].end());
+
 }
 
 int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
                         uint32_t n) {
-  if (src_len < 6) return SZIP_ERR_TRUNCATED;
+  if (src_len < 1) return SZIP_ERR_TRUNCATED;
   const uint32_t mode = src[0];
-  if (mode > 3) return SZIP_ERR_CORRUPT;
+  const uint32_t delta_id = (mode >> 3) & 7u;
+  static const uint32_t kDeltas[5] = {0, 1, 2, 4, 8};
+  if (delta_id > 4) return SZIP_ERR_CORRUPT;
+  const uint32_t delta = kDeltas[delta_id];
+  if (mode & 4u) {
+    // v6 BWT block codec
+    if (bwt::decode_block(src + 1, static_cast<uint32_t>(src_len - 1), dst, n))
+      return SZIP_ERR_CORRUPT;
+    if (delta)
+      for (uint32_t i = delta; i < n; ++i) dst[i] = (uint8_t)(dst[i] + dst[i - delta]);
+    return SZIP_OK;
+  }
+  if (src_len < 6) return SZIP_ERR_TRUNCATED;
   RcDecoder rc(src + 1, src_len - 1);
   if (!rc.init()) return SZIP_ERR_TRUNCATED;
 
@@ -1005,6 +1134,8 @@ int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
   }
   if (!rc.ok()) return SZIP_ERR_TRUNCATED;
   if (rc.pos() != src_len - 1) return SZIP_ERR_CORRUPT;
+  if (delta)
+    for (uint32_t i = delta; i < n; ++i) dst[i] = (uint8_t)(dst[i] + dst[i - delta]);
   return SZIP_OK;
 }
 
@@ -1057,6 +1188,17 @@ bool write_header(std::ostream &os, uint32_t block_size, uint64_t total_raw) {
   return static_cast<bool>(os);
 }
 
+// Bare stored form (v6+): 'S','Z','P',(0x80|ver) + raw bytes to EOF.
+// Selected when a whole file fits in one block and no codec shrinks it;
+// 4-byte frame, no CRC (data is stored verbatim).
+inline bool is_bare_magic(const unsigned char m[4]) {
+  return m[0] == SZIP_MAGIC0 && m[1] == SZIP_MAGIC1 && m[2] == SZIP_MAGIC2 &&
+         (m[3] & SZIP_BARE_FLAG) != 0;
+}
+inline int bare_version(const unsigned char m[4]) {
+  return m[3] & ~SZIP_BARE_FLAG;
+}
+
 int read_and_check_header(std::istream &is, uint32_t *block_size,
                           uint64_t *total_raw) {
   unsigned char magic[4];
@@ -1068,7 +1210,7 @@ int read_and_check_header(std::istream &is, uint32_t *block_size,
   if (!is.read(reinterpret_cast<char *>(&ver), 1) ||
       !is.read(reinterpret_cast<char *>(&flags), 1))
     return SZIP_ERR_TRUNCATED;
-  if (ver != 4 && ver != SZIP_VERSION) return SZIP_ERR_UNSUPPORTED;
+  if (ver < 4 || ver > SZIP_VERSION) return SZIP_ERR_UNSUPPORTED;
   uint16_t reserved = 0;
   if (!get_u16(is, &reserved)) return SZIP_ERR_TRUNCATED;
   if (!get_u32(is, block_size)) return SZIP_ERR_TRUNCATED;
@@ -1096,7 +1238,7 @@ int read_and_check_block_header(std::istream &is, uint8_t *type,
 
 // ------------------------------------------------------------- container --
 
-void set_parse_fast(int fast) { g_parse_fast = fast ? 1 : 0; }
+void set_parse_fast(int fast) { g_parse_fast = fast < 0 ? 0 : fast; }
 
 int compress_file(const std::string &in_path, const std::string &out_path,
                   uint32_t block_size) {
@@ -1110,6 +1252,46 @@ int compress_file(const std::string &in_path, const std::string &out_path,
 
   std::ofstream os(out_path, std::ios::binary | std::ios::trunc);
   if (!os) return SZIP_ERR_IO;
+
+  // Single-block files that no codec can shrink use the bare stored form
+  // (4-byte frame).  Compressible single-block files get the normal
+  // container around the one block (no re-encode).
+  if (total <= block_size) {
+    std::vector<uint8_t> raw((size_t)total);
+    if (total > 0 &&
+        !is.read(reinterpret_cast<char *>(raw.data()), (std::streamsize)total))
+      return SZIP_ERR_IO;
+    std::vector<uint8_t> payload;
+    encode_block_szlzrc(raw.data(), static_cast<uint32_t>(total), payload);
+    if (payload.size() >= (size_t)total) {
+      char hdr[4] = {(char)SZIP_MAGIC0, (char)SZIP_MAGIC1, (char)SZIP_MAGIC2,
+                     (char)(SZIP_BARE_FLAG | SZIP_VERSION)};
+      os.write(hdr, 4);
+      if (total > 0)
+        os.write(reinterpret_cast<const char *>(raw.data()),
+                 (std::streamsize)total);
+      return os ? SZIP_OK : SZIP_ERR_IO;
+    }
+    if (!write_header(os, block_size, total)) return SZIP_ERR_IO;
+    char hdr[SZIP_BLOCK_HEADER_SIZE];
+    hdr[0] = SZIP_BLOCK_SZLZRC;
+    hdr[1] = 0;
+    hdr[2] = static_cast<char>(total & 0xFF);
+    hdr[3] = static_cast<char>((total >> 8) & 0xFF);
+    hdr[4] = static_cast<char>((total >> 16) & 0xFF);
+    hdr[5] = static_cast<char>((total >> 24) & 0xFF);
+    const uint32_t comp_size = static_cast<uint32_t>(payload.size());
+    hdr[6] = static_cast<char>(comp_size & 0xFF);
+    hdr[7] = static_cast<char>((comp_size >> 8) & 0xFF);
+    hdr[8] = static_cast<char>((comp_size >> 16) & 0xFF);
+    hdr[9] = static_cast<char>((comp_size >> 24) & 0xFF);
+    os.write(hdr, SZIP_BLOCK_HEADER_SIZE);
+    os.write(reinterpret_cast<const char *>(payload.data()), comp_size);
+    put_u32(os, szip_crc32(raw.data(), (size_t)total));
+    char magic[4] = {SZIP_MAGIC0, SZIP_MAGIC1, SZIP_MAGIC2, SZIP_MAGIC3};
+    os.write(magic, 4);
+    return os ? SZIP_OK : SZIP_ERR_IO;
+  }
 
   if (!write_header(os, block_size, total)) return SZIP_ERR_IO;
 
@@ -1164,9 +1346,38 @@ int compress_buffer(const uint8_t *data, size_t len,
                     std::vector<uint8_t> &out, uint32_t block_size) {
   if (block_size == 0 || block_size > (1u << 24)) return SZIP_ERR_FORMAT;
   if (len > (size_t)1 << 32) return SZIP_ERR_FORMAT;
+  std::vector<uint8_t> payload;
+  // Single-block bare/normal fast path (mirrors compress_file).
+  if (len <= block_size) {
+    encode_block_szlzrc(data, static_cast<uint32_t>(len), payload);
+    if (payload.size() >= len) {
+      out.resize(4 + len);
+      out[0] = SZIP_MAGIC0; out[1] = SZIP_MAGIC1; out[2] = SZIP_MAGIC2;
+      out[3] = (uint8_t)(SZIP_BARE_FLAG | SZIP_VERSION);
+      if (len) std::memcpy(out.data() + 4, data, len);
+      return SZIP_OK;
+    }
+    std::ostringstream os(std::ios::binary);
+    if (!write_header(os, block_size, len)) return SZIP_ERR_IO;
+    char hdr[SZIP_BLOCK_HEADER_SIZE];
+    hdr[0] = SZIP_BLOCK_SZLZRC; hdr[1] = 0;
+    hdr[2] = (char)(len & 0xFF);        hdr[3] = (char)((len >> 8) & 0xFF);
+    hdr[4] = (char)((len >> 16) & 0xFF); hdr[5] = (char)((len >> 24) & 0xFF);
+    const uint32_t comp_size = (uint32_t)payload.size();
+    hdr[6] = (char)(comp_size & 0xFF);   hdr[7] = (char)((comp_size >> 8) & 0xFF);
+    hdr[8] = (char)((comp_size >> 16) & 0xFF);
+    hdr[9] = (char)((comp_size >> 24) & 0xFF);
+    os.write(hdr, SZIP_BLOCK_HEADER_SIZE);
+    os.write((const char *)payload.data(), comp_size);
+    put_u32(os, szip_crc32(data, len));
+    char magic[4] = {SZIP_MAGIC0, SZIP_MAGIC1, SZIP_MAGIC2, SZIP_MAGIC3};
+    os.write(magic, 4);
+    const std::string &tmp = os.str();
+    out.assign(tmp.begin(), tmp.end());
+    return SZIP_OK;
+  }
   std::ostringstream os(std::ios::binary);
   if (!write_header(os, block_size, len)) return SZIP_ERR_IO;
-  std::vector<uint8_t> payload;
   uint32_t crc = 0;
   size_t off = 0;
   while (off < len) {
@@ -1200,6 +1411,14 @@ int compress_buffer(const uint8_t *data, size_t len,
 
 int decompress_buffer(const uint8_t *data, size_t len,
                       std::vector<uint8_t> &out) {
+  if (len < 4) return SZIP_ERR_TRUNCATED;
+  const unsigned char m[4] = {data[0], data[1], data[2], data[3]};
+  if (is_bare_magic(m)) {
+    const int ver = bare_version(m);
+    if (ver < 4 || ver > SZIP_VERSION) return SZIP_ERR_UNSUPPORTED;
+    out.assign(data + 4, data + len);
+    return SZIP_OK;
+  }
   std::istringstream is(std::string((const char *)data, len), std::ios::binary);
   uint32_t block_size = 0;
   uint64_t total = 0;
@@ -1243,6 +1462,26 @@ int decompress_file(const std::string &in_path, const std::string &out_path,
                     uint64_t *raw_out, uint32_t *crc_out) {
   std::ifstream is(in_path, std::ios::binary);
   if (!is) return SZIP_ERR_IO;
+
+  unsigned char magic[4];
+  if (!is.read(reinterpret_cast<char *>(magic), 4)) return SZIP_ERR_TRUNCATED;
+  if (is_bare_magic(magic)) {
+    const int ver = bare_version(magic);
+    if (ver < 4 || ver > SZIP_VERSION) return SZIP_ERR_UNSUPPORTED;
+    std::ofstream os(out_path, std::ios::binary | std::ios::trunc);
+    if (!os) return SZIP_ERR_IO;
+    std::vector<char> buf(1 << 16);
+    uint64_t produced = 0;
+    while (is.read(buf.data(), (std::streamsize)buf.size()) || is.gcount() > 0) {
+      const std::streamsize got = is.gcount();
+      if (!os.write(buf.data(), got)) return SZIP_ERR_IO;
+      produced += (uint64_t)got;
+    }
+    if (raw_out) *raw_out = produced;
+    if (crc_out) *crc_out = 0; // bare form stores data verbatim (no checksum)
+    return os ? SZIP_OK : SZIP_ERR_IO;
+  }
+  is.seekg(0);
 
   uint32_t block_size = 0;
   uint64_t total_raw = 0;
@@ -1308,6 +1547,18 @@ int decompress_file(const std::string &in_path, const std::string &out_path,
 int test_file(const std::string &in_path, uint64_t *raw_out) {
   std::ifstream is(in_path, std::ios::binary);
   if (!is) return SZIP_ERR_IO;
+
+  unsigned char magic[4];
+  if (!is.read(reinterpret_cast<char *>(magic), 4)) return SZIP_ERR_TRUNCATED;
+  if (is_bare_magic(magic)) {
+    const int ver = bare_version(magic);
+    if (ver < 4 || ver > SZIP_VERSION) return SZIP_ERR_UNSUPPORTED;
+    is.seekg(0, std::ios::end);
+    const uint64_t produced = (uint64_t)is.tellg() - 4;
+    if (raw_out) *raw_out = produced;
+    return SZIP_OK; // verbatim storage: nothing further to validate
+  }
+  is.seekg(0);
 
   uint32_t block_size = 0;
   uint64_t total_raw = 0;

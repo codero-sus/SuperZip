@@ -1,4 +1,4 @@
-# G0D SZIP — `.szip` Container Format (v5)
+# G0D SZIP — `.szip` Container Format (v6)
 
 Reference project: **SuperZip / G0D SZIP**. This document is normative for the
 byte layout of `.szip` archives and the SZLZRC v3 bitstream.
@@ -30,7 +30,7 @@ header (20 bytes) | block* | footer (8 bytes)
 | off | size | field |
 |-----|------|-------|
 | 0   | 4    | magic `"SZP1"` |
-| 4   | 1    | `version` = `5` (v4 headers are also accepted) |
+| 4   | 1    | `version` = `6` (v4 and v5 headers are also accepted) |
 | 5   | 1    | flags (reserved, zero) |
 | 6   | 2    | reserved, zero |
 | 8   | 4    | `block_size` (max block raw size, LE u32) |
@@ -55,13 +55,39 @@ Sum of block `raw_size` fields must equal the header `total_raw`.
 `stream_crc` (LE u32, CRC-32/ISO-HDLC of the raw stream) and `reserved`
 (LE u32, zero).
 
+### 1.4 Bare stored form (v6+)
+
+When a whole file fits in one block and no codec can shrink it, the encoder
+writes the **bare stored form** instead of the container above:
+
+```
+magic "SZP" (3 bytes) | flags+version (1 byte) | raw bytes to EOF
+```
+
+The 4th byte is `0x80 | version` (`SZIP_BARE_FLAG | SZIP_VERSION`).  There is
+no block framing, no length field and no CRC — the payload is the file,
+verbatim.  Decoders detect the form by `"SZP"` and the high bit of byte 3;
+v4/v5 decoders reject it on the magic.  Rationale: incompressible input is
+stored exactly as-is with a 4-byte frame, the smallest honest overhead in the
+field (a brotli/zstd stored stream needs 5+ bytes).
+
 ---
 
 ## 2. Block codec: SZLZRC v4 (`type = 1`)
 
-**S**uper**Z**ip **LZ**77 + **R**ange **C**oder + context mixing, v5.
+**S**uper**Z**ip **LZ**77 + **R**ange **C**oder + context mixing.
 
-The payload begins with one **mode byte** = `(regime << 1) | mixer`:
+The payload begins with one **mode byte**:
+
+```
+bit 0    mixer        (LZ path)
+bit 1    regime       (LZ path)
+bit 2    codec: 0 = SZLZRC (LZ), 1 = BWT (see §2.7)
+bits 3-5 delta id    (0 = none, 1 = d1, 2 = d2, 3 = d4, 4 = d8; see below)
+bits 6-7 reserved, zero
+```
+
+LZ path (bit 2 = 0), `mode = (regime << 1) | mixer`:
 
 | mode | regime | mixer | availability |
 |------|--------|-------|--------------|
@@ -70,8 +96,16 @@ The payload begins with one **mode byte** = `(regime << 1) | mixer`:
 | 2 | tight token models | word-shape t5 | v5 decoders |
 | 3 | tight token models | gap order-1 t5 | v5 decoders |
 
-A v5 encoder codes all four per block and stores the smallest. v4 files
-(header version 4, mode 0/1) decode byte-exactly with the v5 decoder.
+**Byte-delta transform (v6):** when the delta id is non-zero the decoded
+block bytes `p` satisfy `p[i] = raw[i] - raw[i-d] (mod 256)` with `d` the
+delta distance (1, 2, 4 or 8); the decoder restores `raw` in place with
+`raw[i] = p[i] + raw[i-d]`.  First `d` bytes are stored undifferenced.
+
+A v5 encoder codes all four LZ modes per block and stores the smallest. v4
+files (header version 4, mode 0/1) decode byte-exactly with the v5 and v6
+decoders.  A v6 encoder additionally codes BWT candidates (raw block and
+each of the four delta transforms) and ships the smallest of all; v4/v5
+decoders reject v6 streams on the version field.
 
 Pipeline: LZ77 factorization (hash chains, price-aware parse, 1 MiB window,
 last-3 rep offsets) → token stream → adaptive binary range coder (carryless,
@@ -264,6 +298,32 @@ respecting the grammar decodes correctly. The shipped encoder uses
 Raw bytes verbatim. The encoder picks stored whenever the compressed payload
 would not be smaller than `raw_size` (incompressible data never expands).
 
+### 2.7 BWT block codec (v6, `type = 1`, mode bit 2 set)
+
+Payload after the mode byte:
+
+| field | size | meaning |
+|-------|------|---------|
+| `primary` | 4 | BWT row of the unrotated input (LE u32) |
+| `coder` | 1 | 0..3, selects the entropy coder below |
+| stream | rest | the range-coder stream |
+
+Transform: build the suffix array of the block's **rotations** (cyclic
+doubling, ties left in radix-sort order), `bw[i] = raw[(sa[i] - 1) mod n]`.
+Entropy coders over `bw` (each an ordinary `RcEncoder` stream):
+
+| coder | model |
+|-------|-------|
+| 0 | raw `bw` columns through the §2.4 mixer (word-shape mode) |
+| 1 | MTF ranks of `bw` through the mixer (word-shape mode) |
+| 2 | raw `bw` columns, mixer gap mode |
+| 3 | MTF ranks, mixer gap mode |
+
+Decoders invert MTF (if used) and then `bw` via the standard last/first
+walk from `primary`, finally applying the byte-delta inverse if the mode
+byte requested it.  Blocks of raw size 1 use a degenerate 2-byte payload
+(`coder = 0`, one literal byte) and skip `primary`/MTF.
+
 ---
 
 ## 3. Integrity
@@ -290,3 +350,12 @@ class (rep vs normal) and selects the offset-slot model by length class
 all four modes per block and store the smallest. v4 streams (version 4
 header, mode 0/1) decode byte-exactly with a v5 decoder; v5 mode-2/3
 streams are rejected by v4 decoders.
+
+`version = 6` (2026-11-07) makes the mode byte extensible: bit 2 selects the
+BWT block codec (§2.7, min-of-4 entropy coders) and bits 3-5 select the
+byte-delta transform.  v6 encoders code all four LZ modes, the BWT codec on
+the raw block and on each of the four delta transforms, and store the
+smallest (self-tuning min-of-all).  The bare stored form (§1.4) adds a
+4-byte frame for incompressible single-block files.  v4 and v5 streams
+(header version 4/5, delta id 0) decode byte-exactly with a v6 decoder;
+v6 streams are rejected by older decoders on the version field.
