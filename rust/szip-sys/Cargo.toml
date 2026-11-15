@@ -1,0 +1,8 @@
+[package]
+name = "szip-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "G0D SZIP — FFI bridge to the C++ engine (native/), no crates.io deps"
+
+[dependencies]

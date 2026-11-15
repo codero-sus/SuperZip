@@ -1,0 +1,7 @@
+build/
+target/
+*.o
+*.a
+*.szip
+*.tmp
+__pycache__/

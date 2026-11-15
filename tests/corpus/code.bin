@@ -1,0 +1,2100 @@
+// G0D SZIP — CLI (g0dszip). Own encoder/decoder; no third-party code.
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
+#include "szip.h"
+
+namespace {
+
+const char *err_name(int e) {
+  switch (e) {
+  case SZIP_OK: return "ok";
+  case SZIP_ERR_IO: return "i/o error";
+  case SZIP_ERR_FORMAT: return "bad format";
+  case SZIP_ERR_CORRUPT: return "corrupt archive";
+  case SZIP_ERR_UNSUPPORTED: return "unsupported feature";
+  case SZIP_ERR_NOMEM: return "out of memory";
+  case SZIP_ERR_TRUNCATED: return "truncated archive";
+  case SZIP_ERR_BUFFER: return "buffer too small";
+  default: return "unknown error";
+  }
+}
+
+void usage() {
+  std::fprintf(stderr,
+               "G0D SZIP — SuperZip compressor (format .szip)\n"
+               "\n"
+               "usage:\n"
+               "  g0dszip c|compress  [-b blocksize] <input> <output.szip>\n"
+               "  g0dszip d|decompress <input.szip> <output>\n"
+               "  g0dszip t|test       <input.szip>\n"
+               "  g0dszip i|info       <input.szip>\n"
+               "\n"
+               "  -b N   raw block size in bytes (default 1048576, max 16777216)\n");
+}
+
+bool parse_u32(const char *s, uint32_t *v) {
+  char *end = nullptr;
+  const unsigned long long x = std::strtoull(s, &end, 10);
+  if (!end || *end != 0 || x == 0 || x > 0xFFFFFFFFull) return false;
+  *v = static_cast<uint32_t>(x);
+  return true;
+}
+
+int cmd_info(const char *path) {
+  uint64_t raw = 0;
+  // test_file validates and returns the raw size
+  const int e = szip::test_file(path, &raw);
+  if (e != SZIP_OK) {
+    std::fprintf(stderr, "info: %s: %s\n", path, err_name(e));
+    return 1;
+  }
+  std::FILE *f = std::fopen(path, "rb");
+  if (!f) {
+    std::fprintf(stderr, "info: cannot open %s\n", path);
+    return 1;
+  }
+  std::fseek(f, 0, SEEK_END);
+  const long comp = std::ftell(f);
+  std::fclose(f);
+  std::printf("file       : %s\n", path);
+  std::printf("format     : .szip v%d\n", SZIP_VERSION);
+  std::printf("codec      : SZLZRC v3 (LZ77 + rep-matches + context-mixing literals)\n");
+  std::printf("raw size   : %llu bytes\n", (unsigned long long)raw);
+  std::printf("archive    : %ld bytes\n", comp);
+  if (raw > 0)
+    std::printf("ratio      : %.2f%%  (%.3f bits/byte)\n",
+                100.0 * (double)comp / (double)raw,
+                8.0 * (double)comp / (double)raw);
+  std::printf("integrity  : CRC32 verified\n");
+  return 0;
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+  if (argc < 2) {
+    usage();
+    return 2;
+  }
+  const std::string cmd = argv[1];
+
+  if (cmd == "-h" || cmd == "--help" || cmd == "help") {
+    usage();
+    return 0;
+  }
+
+  if (cmd == "c" || cmd == "compress") {
+    uint32_t block_size = SZIP_DEFAULT_BLOCK_SIZE;
+    int i = 2;
+    if (i + 1 < argc && std::strcmp(argv[i], "-b") == 0) {
+      if (!parse_u32(argv[i + 1], &block_size)) {
+        std::fprintf(stderr, "bad block size: %s\n", argv[i + 1]);
+        return 2;
+      }
+      i += 2;
+    }
+    if (argc - i != 2) {
+      usage();
+      return 2;
+    }
+    const int e = szip::compress_file(argv[i], argv[i + 1], block_size);
+    if (e != SZIP_OK) {
+      std::fprintf(stderr, "compress: %s\n", err_name(e));
+      return 1;
+    }
+    return 0;
+  }
+
+  if (cmd == "d" || cmd == "decompress") {
+    if (argc != 4) {
+      usage();
+      return 2;
+    }
+    const int e = szip::decompress_file(argv[2], argv[3], nullptr, nullptr);
+    if (e != SZIP_OK) {
+      std::fprintf(stderr, "decompress: %s\n", err_name(e));
+      return 1;
+    }
+    return 0;
+  }
+
+  if (cmd == "t" || cmd == "test") {
+    if (argc != 3) {
+      usage();
+      return 2;
+    }
+    uint64_t raw = 0;
+    const int e = szip::test_file(argv[2], &raw);
+    if (e != SZIP_OK) {
+      std::fprintf(stderr, "test: %s: %s\n", argv[2], err_name(e));
+      return 1;
+    }
+    std::printf("%s: ok (%llu bytes)\n", argv[2], (unsigned long long)raw);
+    return 0;
+  }
+
+  if (cmd == "i" || cmd == "info") {
+    if (argc != 3) {
+      usage();
+      return 2;
+    }
+    return cmd_info(argv[2]);
+  }
+
+  usage();
+  return 2;
+}
+// G0D SZIP — SZLZRC v3 block codec, .szip container, C ABI.
+// Original implementation for SuperZip; no third-party compression code.
+//
+// SZLZRC v3: LZ77 (hash chains, lazy) + last-3 rep offsets + context-mixing
+// literals + adaptive binary range coder.
+#include "szip.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <vector>
+
+#include "crc32.hpp"
+#include "lz77.hpp"
+#include "mix.hpp"
+#ifndef SZ_MATCHBIAS
+#define SZ_MATCHBIAS 16
+#endif
+#ifndef SZ_NOMATCH
+#define SZ_NOMATCH 0
+#endif
+#include "rc.hpp"
+
+#ifndef SZ_STATS
+#define SZ_STATS 0
+#endif
+#if SZ_STATS
+static uint64_t st_lit, st_rep[3], st_norm, st_repb, st_nmb, st_bytes;
+static uint64_t st_nhist[24];
+static uint64_t st_offbits, st_lenbits, st_litbits, st_tokbits;
+#endif
+
+namespace szip {
+namespace {
+
+// ---------------------------------------------------------------- models --
+
+struct Model {
+  Prob is_match = kProbInit;
+  Prob is_rep = kProbInit;
+  Prob rep_sel[2] = {kProbInit, kProbInit}; // 0: rep0|rep12, 1: rep1|rep2
+  Prob len_unary[12];   // gamma of (len - 2), x in [1, 271]
+  Prob len_bits[10];
+  Prob off_mode = kProbInit;      // 0: tiny (off 1-4), 1: slot+direct
+  Prob tiny_unary[8];             // gamma of (off), x in [1, 4]
+  Prob tiny_bits[8];
+  Prob slot_unary[12];            // gamma of (n - 2), x in [1, 18]
+  Prob slot_bits[10];
+  Prob off_direct[19];            // low n-1 bits of off-1
+
+  Model() {
+    std::fill(std::begin(len_unary), std::end(len_unary), static_cast<Prob>(kProbInit));
+    std::fill(std::begin(len_bits), std::end(len_bits), static_cast<Prob>(kProbInit));
+    std::fill(std::begin(tiny_unary), std::end(tiny_unary), static_cast<Prob>(kProbInit));
+    std::fill(std::begin(tiny_bits), std::end(tiny_bits), static_cast<Prob>(kProbInit));
+    std::fill(std::begin(slot_unary), std::end(slot_unary), static_cast<Prob>(kProbInit));
+    std::fill(std::begin(slot_bits), std::end(slot_bits), static_cast<Prob>(kProbInit));
+    std::fill(std::begin(off_direct), std::end(off_direct), static_cast<Prob>(kProbInit));
+  }
+
+};
+
+// ------------------------------------------------------------- primitives --
+
+// Elias gamma for x >= 1: n one-bits, one zero-bit, then n low bits MSB first.
+void encode_gamma(RcEncoder &rc, Prob *unary, Prob *bits, uint32_t x) {
+  uint32_t n = 0;
+  while ((2u << n) <= x) ++n;
+  for (uint32_t i = 0; i < n; ++i) rc.encode_bit(unary[i], 1);
+  rc.encode_bit(unary[n], 0);
+  for (uint32_t i = n; i-- > 0;) rc.encode_bit(bits[i], (x >> i) & 1u);
+}
+
+int decode_gamma(RcDecoder &rc, Prob *unary, Prob *bits, uint32_t n_max,
+                 uint32_t *out) {
+  uint32_t n = 0;
+  while (rc.decode_bit(unary[n]) == 1) {
+    ++n;
+    if (n > n_max) return SZIP_ERR_CORRUPT;
+  }
+  uint32_t x = 1;
+  for (uint32_t i = n; i-- > 0;) x = (x << 1) | rc.decode_bit(bits[i]);
+  *out = x;
+  return SZIP_OK;
+}
+
+// Offset: u = off - 1, n = bitlen(u).
+//   tiny mode  (off 1-4):      gamma(off)
+//   slot mode  (off >= 5):     gamma(n - 2), then n-1 direct low bits of u
+void encode_offset(RcEncoder &rc, Model &m, uint32_t off) {
+  const uint32_t u = off - 1;
+#if SZ_STATS
+  { uint32_t nn = 0; while ((1u << nn) <= u) ++nn; ++st_nhist[nn]; }
+#endif
+  if (u < 4) {
+    rc.encode_bit(m.off_mode, 0);
+    encode_gamma(rc, m.tiny_unary, m.tiny_bits, off);
+    return;
+  }
+  rc.encode_bit(m.off_mode, 1);
+  uint32_t n = 0;
+  while ((1u << n) <= u) ++n;
+  encode_gamma(rc, m.slot_unary, m.slot_bits, n - 2);
+  for (uint32_t i = n - 1; i-- > 0;)
+    rc.encode_bit(m.off_direct[i], (u >> i) & 1u);
+}
+
+int decode_offset(RcDecoder &rc, Model &m, uint32_t *out) {
+  if (rc.decode_bit(m.off_mode) == 0) {
+    uint32_t off = 0;
+    int e = decode_gamma(rc, m.tiny_unary, m.tiny_bits, 6, &off);
+    if (e != SZIP_OK) return e;
+    if (off == 0 || off > 4) return SZIP_ERR_CORRUPT;
+    *out = off;
+    return SZIP_OK;
+  }
+  uint32_t x = 0;
+  int e = decode_gamma(rc, m.slot_unary, m.slot_bits, 10, &x);
+  if (e != SZIP_OK) return e;
+  if (x < 1 || x > 18) return SZIP_ERR_CORRUPT;
+  const uint32_t n = x + 2;
+  uint32_t u = 1u << (n - 1);
+  for (uint32_t i = n - 1; i-- > 0;)
+    u |= rc.decode_bit(m.off_direct[i]) << i;
+  if (u + 1 > SZIP_MAX_OFFSET) return SZIP_ERR_CORRUPT;
+  *out = u + 1;
+  return SZIP_OK;
+}
+
+// ------------------------------------------------------------ block codec --
+
+struct RepPick {
+  uint32_t len = 0;
+  uint32_t idx = 0;
+};
+
+RepPick rep_match(const uint8_t *src, uint32_t n, uint32_t pos,
+                  const uint32_t reps[3]) {
+  RepPick best;
+  const uint32_t max_len = std::min<uint32_t>(kMaxMatch, n - pos);
+  for (uint32_t i = 0; i < 3; ++i) {
+    const uint32_t off = reps[i];
+    if (off == 0 || off > pos) continue;
+    uint32_t len = 0;
+    while (len < max_len && src[pos + len] == src[pos - off + len]) ++len;
+    if (len >= kMinMatch && len > best.len) {
+      best.len = len;
+      best.idx = i;
+    }
+  }
+  return best;
+}
+
+void reps_after_normal(uint32_t reps[3], uint32_t off) {
+  reps[2] = reps[1];
+  reps[1] = reps[0];
+  reps[0] = off;
+}
+
+void reps_after_rep(uint32_t reps[3], uint32_t idx) {
+  if (idx > 0) {
+    const uint32_t tmp = reps[idx];
+    for (uint32_t j = idx; j > 0; --j) reps[j] = reps[j - 1];
+    reps[0] = tmp;
+  }
+}
+
+void encode_block_szlzrc(const uint8_t *src, uint32_t n,
+                         std::vector<uint8_t> &out, uint32_t parse_bias = 16) {
+  out.clear();
+  RcEncoder rc(out);
+  Model m;
+  MatchFinder mf;
+  mf.prepare(n);
+
+  std::vector<uint8_t> inserted(n, 0);
+  MixLit mix;
+  Hist hist;
+  uint32_t pos = 0;
+  uint32_t reps[3] = {0, 0, 0};
+
+  auto ensure = [&](uint32_t p) {
+    if (p < n && !inserted[p]) {
+      inserted[p] = 1;
+      mf.insert(src, n, p);
+    }
+  };
+  auto emit_literal = [&](uint32_t p) {
+#if SZ_STATS
+    ++st_lit; ++st_bytes; uint64_t b0 = rc.bits;
+#endif
+    rc.encode_bit(m.is_match, 0);
+    mix.encode(rc, hist, src[p]); // trains + pushes hist
+#if SZ_STATS
+    st_litbits += rc.bits - b0;
+#endif
+  };
+
+  while (pos < n) {
+    ensure(pos);
+    const RepPick rep = rep_match(src, n, pos, reps);
+    const Match nm = mf.find(src, n, pos);
+
+    // bit prices (gamma cost model), deterministic
+    auto price_gamma = [](uint32_t x) {
+      uint32_t g = 0;
+      while ((2u << g) <= x) ++g;
+      return 2 * g + 1;
+    };
+    bool use_rep = false;
+    if (rep.len >= kMinMatch) {
+      if (nm.len < kMinMatch || rep.len > nm.len) {
+        use_rep = true;
+      } else {
+        // rep covers rep.len bytes at rep_cost; the normal match covers nm.len
+        // at nm_cost. Estimate covering the shortfall (~5 bits/byte) afterwards.
+        const uint32_t rep_cost = 3 + price_gamma(rep.len - 2);
+        const uint32_t nm_cost = price_gamma(nm.off) + price_gamma(nm.len - 2);
+        use_rep = rep_cost + 5 * (nm.len - rep.len) < nm_cost;
+      }
+    }
+    const uint32_t cur_len = use_rep ? rep.len : nm.len;
+
+    // reject matches that cost more than writing literals (real mixed prices)
+    uint32_t eff_len = cur_len;
+    if (SZ_NOMATCH) eff_len = 0;
+    if (!SZ_NOMATCH && cur_len >= kMinMatch) {
+      const uint32_t est = use_rep
+        ? (uint32_t)(3 + price_gamma(cur_len - 2))
+        : (uint32_t)(1 + price_gamma(nm.off) + price_gamma(cur_len - 2));
+      const uint32_t lit_price = mix.peek_span(hist, src, pos, cur_len); // 1/16 bits
+      if (est * parse_bias > lit_price) eff_len = 0;
+    }
+    if (eff_len >= kMinMatch) {
+      if (eff_len < kNiceLen && pos + 1 < n) {
+        ensure(pos + 1);
+        const RepPick rep2 = rep_match(src, n, pos + 1, reps);
+        const Match nm2 = mf.find(src, n, pos + 1);
+        const uint32_t next_len = std::max(rep2.len, nm2.len);
+        if (next_len >= eff_len + 1) {
+          emit_literal(pos);
+          ++pos;
+          continue;
+        }
+      }
+
+      if (use_rep) {
+#if SZ_STATS
+        ++st_rep[rep.idx]; st_repb += rep.len;
+#endif
+        rc.encode_bit(m.is_match, 1);
+        rc.encode_bit(m.is_rep, 1);
+        rc.encode_bit(m.rep_sel[0], rep.idx == 0 ? 0u : 1u);
+        if (rep.idx != 0) rc.encode_bit(m.rep_sel[1], rep.idx == 1 ? 0u : 1u);
+        encode_gamma(rc, m.len_unary, m.len_bits, rep.len - 2);
+        reps_after_rep(reps, rep.idx);
+        for (uint32_t p = pos + 1; p < pos + rep.len; ++p) ensure(p);
+        for (uint32_t i = pos; i < pos + rep.len; ++i) mix.train_byte(hist, src[i]);
+        pos += rep.len;
+      } else {
+#if SZ_STATS
+        ++st_norm; st_nmb += nm.len; uint64_t b0 = rc.bits;
+#endif
+        rc.encode_bit(m.is_match, 1);
+        rc.encode_bit(m.is_rep, 0);
+#if SZ_STATS
+        uint64_t b1 = rc.bits;
+#endif
+        encode_offset(rc, m, nm.off);
+#if SZ_STATS
+        st_offbits += rc.bits - b1;
+#endif
+        encode_gamma(rc, m.len_unary, m.len_bits, nm.len - 2);
+#if SZ_STATS
+        st_lenbits += rc.bits - b1 - st_offbits; st_tokbits += rc.bits - b0;
+#endif
+        reps_after_normal(reps, nm.off);
+        for (uint32_t p = pos + 1; p < pos + nm.len; ++p) ensure(p);
+        for (uint32_t i = pos; i < pos + nm.len; ++i) mix.train_byte(hist, src[i]);
+        pos += nm.len;
+      }
+    } else {
+      emit_literal(pos);
+      ++pos;
+    }
+  }
+  rc.flush();
+#if SZ_STATS
+  fprintf(stderr, "[stats] lit=%llu rep0=%llu(%lluB) rep1=%llu(%lluB) rep2=%llu(%lluB) norm=%llu(%lluB)\n",
+          (unsigned long long)st_lit,
+          (unsigned long long)st_rep[0], (unsigned long long)st_repb,
+          (unsigned long long)st_rep[1], (unsigned long long)0ULL,
+          (unsigned long long)st_rep[2], (unsigned long long)0ULL,
+          (unsigned long long)st_norm, (unsigned long long)st_nmb);
+  fprintf(stderr, "[stats] n-hist(off): ");
+  for (int i = 0; i < 20; ++i) if (st_nhist[i]) fprintf(stderr, "n=%d:%llu ", i, (unsigned long long)st_nhist[i]);
+  fprintf(stderr, "\n");
+  fprintf(stderr, "[stats] bits: off=%llu len=%llu lit=%llu normtok=%llu\n",
+          (unsigned long long)st_offbits, (unsigned long long)st_lenbits,
+          (unsigned long long)st_litbits, (unsigned long long)st_tokbits);
+#endif
+}
+
+int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
+                        uint32_t n) {
+  if (src_len < 5) return SZIP_ERR_TRUNCATED;
+  RcDecoder rc(src, src_len);
+  if (!rc.init()) return SZIP_ERR_TRUNCATED;
+
+  Model m;
+  MixLit mix;
+  Hist hist;
+  uint32_t out_pos = 0;
+  uint32_t reps[3] = {0, 0, 0};
+
+  while (out_pos < n) {
+    if (rc.decode_bit(m.is_match) == 0) {
+      dst[out_pos] = mix.decode(rc, hist);
+      hist.push(dst[out_pos]);
+      ++out_pos;
+    } else if (rc.decode_bit(m.is_rep) == 1) {
+      uint32_t idx = 0;
+      if (rc.decode_bit(m.rep_sel[0]) == 1)
+        idx = (rc.decode_bit(m.rep_sel[1]) == 0) ? 1u : 2u;
+
+      uint32_t xlen = 0;
+      int e = decode_gamma(rc, m.len_unary, m.len_bits, 10, &xlen);
+      if (e != SZIP_OK) return e;
+      if (!rc.ok()) return SZIP_ERR_TRUNCATED;
+      const uint32_t len = xlen + 2;
+      if (len < kMinMatch || len > kMaxMatch) return SZIP_ERR_CORRUPT;
+      const uint32_t off = reps[idx];
+      if (off == 0 || off > out_pos) return SZIP_ERR_CORRUPT;
+      if (len > n - out_pos) return SZIP_ERR_CORRUPT;
+
+      for (uint32_t i = 0; i < len; ++i)
+        dst[out_pos + i] = dst[out_pos - off + i];
+      reps_after_rep(reps, idx);
+      for (uint32_t i = 0; i < len; ++i)
+        mix.train_byte(hist, dst[out_pos + i]);
+      out_pos += len;
+    } else {
+      uint32_t off = 0;
+      int e = decode_offset(rc, m, &off);
+      if (e != SZIP_OK) return e;
+      uint32_t xlen = 0;
+      e = decode_gamma(rc, m.len_unary, m.len_bits, 10, &xlen);
+      if (e != SZIP_OK) return e;
+      if (!rc.ok()) return SZIP_ERR_TRUNCATED;
+      const uint32_t len = xlen + 2;
+      if (len < kMinMatch || len > kMaxMatch) return SZIP_ERR_CORRUPT;
+      if (off == 0 || off > out_pos) return SZIP_ERR_CORRUPT;
+      if (len > n - out_pos) return SZIP_ERR_CORRUPT;
+
+      for (uint32_t i = 0; i < len; ++i)
+        dst[out_pos + i] = dst[out_pos - off + i];
+      reps_after_normal(reps, off);
+      for (uint32_t i = 0; i < len; ++i)
+        mix.train_byte(hist, dst[out_pos + i]);
+      out_pos += len;
+    }
+    if (!rc.ok()) return SZIP_ERR_TRUNCATED;
+  }
+  if (!rc.ok()) return SZIP_ERR_TRUNCATED;
+  if (rc.pos() != src_len) return SZIP_ERR_CORRUPT;
+  return SZIP_OK;
+}
+
+// ------------------------------------------------------------- le helpers --
+
+void put_u16(std::ostream &os, uint16_t v) {
+  char b[2] = {static_cast<char>(v & 0xFF), static_cast<char>((v >> 8) & 0xFF)};
+  os.write(b, 2);
+}
+void put_u32(std::ostream &os, uint32_t v) {
+  char b[4] = {static_cast<char>(v & 0xFF), static_cast<char>((v >> 8) & 0xFF),
+               static_cast<char>((v >> 16) & 0xFF),
+               static_cast<char>((v >> 24) & 0xFF)};
+  os.write(b, 4);
+}
+void put_u64(std::ostream &os, uint64_t v) {
+  put_u32(os, static_cast<uint32_t>(v & 0xFFFFFFFFu));
+  put_u32(os, static_cast<uint32_t>(v >> 32));
+}
+bool get_u16(std::istream &is, uint16_t *v) {
+  unsigned char b[2];
+  if (!is.read(reinterpret_cast<char *>(b), 2)) return false;
+  *v = static_cast<uint16_t>(b[0] | (b[1] << 8));
+  return true;
+}
+bool get_u32(std::istream &is, uint32_t *v) {
+  unsigned char b[4];
+  if (!is.read(reinterpret_cast<char *>(b), 4)) return false;
+  *v = static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8) |
+       (static_cast<uint32_t>(b[2]) << 16) |
+       (static_cast<uint32_t>(b[3]) << 24);
+  return true;
+}
+bool get_u64(std::istream &is, uint64_t *v) {
+  uint32_t lo = 0, hi = 0;
+  if (!get_u32(is, &lo) || !get_u32(is, &hi)) return false;
+  *v = static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+  return true;
+}
+
+bool write_header(std::ostream &os, uint32_t block_size, uint64_t total_raw) {
+  char magic[4] = {SZIP_MAGIC0, SZIP_MAGIC1, SZIP_MAGIC2, SZIP_MAGIC3};
+  os.write(magic, 4);
+  char ver = SZIP_VERSION, flags = 0;
+  os.write(&ver, 1);
+  os.write(&flags, 1);
+  put_u16(os, 0);
+  put_u32(os, block_size);
+  put_u64(os, total_raw);
+  return static_cast<bool>(os);
+}
+
+int read_and_check_header(std::istream &is, uint32_t *block_size,
+                          uint64_t *total_raw) {
+  unsigned char magic[4];
+  if (!is.read(reinterpret_cast<char *>(magic), 4)) return SZIP_ERR_TRUNCATED;
+  if (magic[0] != SZIP_MAGIC0 || magic[1] != SZIP_MAGIC1 ||
+      magic[2] != SZIP_MAGIC2 || magic[3] != SZIP_MAGIC3)
+    return SZIP_ERR_FORMAT;
+  unsigned char ver = 0, flags = 0;
+  if (!is.read(reinterpret_cast<char *>(&ver), 1) ||
+      !is.read(reinterpret_cast<char *>(&flags), 1))
+    return SZIP_ERR_TRUNCATED;
+  if (ver != SZIP_VERSION) return SZIP_ERR_UNSUPPORTED;
+  uint16_t reserved = 0;
+  if (!get_u16(is, &reserved)) return SZIP_ERR_TRUNCATED;
+  if (!get_u32(is, block_size)) return SZIP_ERR_TRUNCATED;
+  if (!get_u64(is, total_raw)) return SZIP_ERR_TRUNCATED;
+  if (*block_size == 0 || *block_size > (1u << 24)) return SZIP_ERR_FORMAT;
+  return SZIP_OK;
+}
+
+int read_and_check_block_header(std::istream &is, uint8_t *type,
+                                uint32_t *raw_size, uint32_t *comp_size) {
+  unsigned char bh[SZIP_BLOCK_HEADER_SIZE];
+  if (!is.read(reinterpret_cast<char *>(bh), SZIP_BLOCK_HEADER_SIZE))
+    return SZIP_ERR_TRUNCATED;
+  *type = bh[0];
+  *raw_size = static_cast<uint32_t>(bh[2]) | (static_cast<uint32_t>(bh[3]) << 8) |
+              (static_cast<uint32_t>(bh[4]) << 16) |
+              (static_cast<uint32_t>(bh[5]) << 24);
+  *comp_size = static_cast<uint32_t>(bh[6]) | (static_cast<uint32_t>(bh[7]) << 8) |
+               (static_cast<uint32_t>(bh[8]) << 16) |
+               (static_cast<uint32_t>(bh[9]) << 24);
+  return SZIP_OK;
+}
+
+} // namespace
+
+// ------------------------------------------------------------- container --
+
+int compress_file(const std::string &in_path, const std::string &out_path,
+                  uint32_t block_size) {
+  if (block_size == 0 || block_size > (1u << 24)) return SZIP_ERR_FORMAT;
+
+  std::ifstream is(in_path, std::ios::binary);
+  if (!is) return SZIP_ERR_IO;
+  is.seekg(0, std::ios::end);
+  const uint64_t total = static_cast<uint64_t>(is.tellg());
+  is.seekg(0, std::ios::beg);
+
+  std::ofstream os(out_path, std::ios::binary | std::ios::trunc);
+  if (!os) return SZIP_ERR_IO;
+
+  if (!write_header(os, block_size, total)) return SZIP_ERR_IO;
+
+  std::vector<uint8_t> block(block_size);
+  std::vector<uint8_t> payload;
+  uint32_t crc = 0;
+  uint64_t remaining = total;
+
+  while (remaining > 0) {
+    const uint32_t want =
+        static_cast<uint32_t>(std::min<uint64_t>(block_size, remaining));
+    if (!is.read(reinterpret_cast<char *>(block.data()), want)) return SZIP_ERR_IO;
+    crc = szip_crc32_update(crc, block.data(), want);
+
+    // Multi-parse: encoder-side only (decoder is agnostic to parse policy).
+    // Try several match/literal price biases and keep the smallest payload.
+    {
+      static const uint32_t kBiases[3] = {13, 16, 20};
+      std::vector<uint8_t> cand;
+      payload.clear();
+      for (uint32_t bias : kBiases) {
+        cand.clear();
+        encode_block_szlzrc(block.data(), want, cand, bias);
+        if (payload.empty() || cand.size() < payload.size())
+          payload.swap(cand);
+      }
+    }
+    const bool store = payload.size() >= want;
+    const uint32_t comp_size =
+        store ? want : static_cast<uint32_t>(payload.size());
+
+    // Block header, explicitly little-endian.
+    char hdr[SZIP_BLOCK_HEADER_SIZE];
+    hdr[0] = store ? SZIP_BLOCK_STORED : SZIP_BLOCK_SZLZRC;
+    hdr[1] = 0;
+    hdr[2] = static_cast<char>(want & 0xFF);
+    hdr[3] = static_cast<char>((want >> 8) & 0xFF);
+    hdr[4] = static_cast<char>((want >> 16) & 0xFF);
+    hdr[5] = static_cast<char>((want >> 24) & 0xFF);
+    hdr[6] = static_cast<char>(comp_size & 0xFF);
+    hdr[7] = static_cast<char>((comp_size >> 8) & 0xFF);
+    hdr[8] = static_cast<char>((comp_size >> 16) & 0xFF);
+    hdr[9] = static_cast<char>((comp_size >> 24) & 0xFF);
+    os.write(hdr, SZIP_BLOCK_HEADER_SIZE);
+
+    if (store)
+      os.write(reinterpret_cast<const char *>(block.data()), want);
+    else
+      os.write(reinterpret_cast<const char *>(payload.data()), comp_size);
+    if (!os) return SZIP_ERR_IO;
+
+    remaining -= want;
+  }
+
+  put_u32(os, crc);
+  char magic[4] = {SZIP_MAGIC0, SZIP_MAGIC1, SZIP_MAGIC2, SZIP_MAGIC3};
+  os.write(magic, 4);
+  return os ? SZIP_OK : SZIP_ERR_IO;
+}
+
+int decompress_file(const std::string &in_path, const std::string &out_path,
+                    uint64_t *raw_out, uint32_t *crc_out) {
+  std::ifstream is(in_path, std::ios::binary);
+  if (!is) return SZIP_ERR_IO;
+
+  uint32_t block_size = 0;
+  uint64_t total_raw = 0;
+  int e = read_and_check_header(is, &block_size, &total_raw);
+  if (e != SZIP_OK) return e;
+
+  std::ofstream os(out_path, std::ios::binary | std::ios::trunc);
+  if (!os) return SZIP_ERR_IO;
+
+  std::vector<uint8_t> payload, raw;
+  uint32_t crc = 0;
+  uint64_t produced = 0;
+
+  while (produced < total_raw) {
+    uint8_t type = 0;
+    uint32_t raw_size = 0, comp_size = 0;
+    e = read_and_check_block_header(is, &type, &raw_size, &comp_size);
+    if (e != SZIP_OK) return e;
+
+    if (raw_size == 0 || raw_size > block_size) return SZIP_ERR_CORRUPT;
+    if (raw_size > total_raw - produced) return SZIP_ERR_CORRUPT;
+    if (type == SZIP_BLOCK_STORED) {
+      if (comp_size != raw_size) return SZIP_ERR_CORRUPT;
+    } else if (type == SZIP_BLOCK_SZLZRC) {
+      if (comp_size < 5 || comp_size > szip_compress_bound(raw_size))
+        return SZIP_ERR_CORRUPT;
+    } else {
+      return SZIP_ERR_UNSUPPORTED;
+    }
+
+    payload.resize(comp_size);
+    if (!is.read(reinterpret_cast<char *>(payload.data()), comp_size))
+      return SZIP_ERR_TRUNCATED;
+
+    raw.resize(raw_size);
+    if (type == SZIP_BLOCK_STORED) {
+      std::memcpy(raw.data(), payload.data(), raw_size);
+    } else {
+      e = decode_block_szlzrc(payload.data(), comp_size, raw.data(), raw_size);
+      if (e != SZIP_OK) return e;
+    }
+
+    crc = szip_crc32_update(crc, raw.data(), raw_size);
+    if (!os.write(reinterpret_cast<const char *>(raw.data()), raw_size))
+      return SZIP_ERR_IO;
+    produced += raw_size;
+  }
+
+  uint32_t stored_crc = 0;
+  if (!get_u32(is, &stored_crc)) return SZIP_ERR_TRUNCATED;
+  unsigned char end_magic[4];
+  if (!is.read(reinterpret_cast<char *>(end_magic), 4)) return SZIP_ERR_TRUNCATED;
+  if (end_magic[0] != SZIP_MAGIC0 || end_magic[1] != SZIP_MAGIC1 ||
+      end_magic[2] != SZIP_MAGIC2 || end_magic[3] != SZIP_MAGIC3)
+    return SZIP_ERR_FORMAT;
+  if (stored_crc != crc) return SZIP_ERR_CORRUPT;
+
+  if (raw_out) *raw_out = produced;
+  if (crc_out) *crc_out = crc;
+  return SZIP_OK;
+}
+
+int test_file(const std::string &in_path, uint64_t *raw_out) {
+  std::ifstream is(in_path, std::ios::binary);
+  if (!is) return SZIP_ERR_IO;
+
+  uint32_t block_size = 0;
+  uint64_t total_raw = 0;
+  int e = read_and_check_header(is, &block_size, &total_raw);
+  if (e != SZIP_OK) return e;
+
+  std::vector<uint8_t> payload, raw;
+  uint32_t crc = 0;
+  uint64_t produced = 0;
+
+  while (produced < total_raw) {
+    uint8_t type = 0;
+    uint32_t raw_size = 0, comp_size = 0;
+    e = read_and_check_block_header(is, &type, &raw_size, &comp_size);
+    if (e != SZIP_OK) return e;
+
+    if (raw_size == 0 || raw_size > block_size) return SZIP_ERR_CORRUPT;
+    if (raw_size > total_raw - produced) return SZIP_ERR_CORRUPT;
+    if (type == SZIP_BLOCK_STORED) {
+      if (comp_size != raw_size) return SZIP_ERR_CORRUPT;
+    } else if (type == SZIP_BLOCK_SZLZRC) {
+      if (comp_size < 5 || comp_size > szip_compress_bound(raw_size))
+        return SZIP_ERR_CORRUPT;
+    } else {
+      return SZIP_ERR_UNSUPPORTED;
+    }
+    payload.resize(comp_size);
+    if (!is.read(reinterpret_cast<char *>(payload.data()), comp_size))
+      return SZIP_ERR_TRUNCATED;
+    raw.resize(raw_size);
+    if (type == SZIP_BLOCK_STORED) {
+      std::memcpy(raw.data(), payload.data(), raw_size);
+    } else {
+      e = decode_block_szlzrc(payload.data(), comp_size, raw.data(), raw_size);
+      if (e != SZIP_OK) return e;
+    }
+    crc = szip_crc32_update(crc, raw.data(), raw_size);
+    produced += raw_size;
+  }
+
+  uint32_t stored_crc = 0;
+  if (!get_u32(is, &stored_crc)) return SZIP_ERR_TRUNCATED;
+  unsigned char end_magic[4];
+  if (!is.read(reinterpret_cast<char *>(end_magic), 4)) return SZIP_ERR_TRUNCATED;
+  if (end_magic[0] != SZIP_MAGIC0 || end_magic[1] != SZIP_MAGIC1 ||
+      end_magic[2] != SZIP_MAGIC2 || end_magic[3] != SZIP_MAGIC3)
+    return SZIP_ERR_FORMAT;
+  if (stored_crc != crc) return SZIP_ERR_CORRUPT;
+  if (raw_out) *raw_out = produced;
+  return SZIP_OK;
+}
+
+} // namespace szip
+
+// ---------------------------------------------------------------- C ABI ----
+
+extern "C" {
+
+size_t szip_compress_bound(size_t raw_len) {
+  return raw_len + raw_len / 2 + 64;
+}
+
+int szip_compress_block(const uint8_t *src, size_t src_len, uint8_t *dst,
+                        size_t dst_cap, size_t *dst_len) {
+  if (!dst_len) return SZIP_ERR_FORMAT;
+  if (src_len == 0) {
+    *dst_len = 0;
+    return SZIP_OK;
+  }
+  if (src_len > (1u << 24)) return SZIP_ERR_FORMAT;
+  try {
+    std::vector<uint8_t> payload, cand;
+    {
+      static const uint32_t kBiases[3] = {13, 16, 20};
+      for (uint32_t bias : kBiases) {
+        cand.clear();
+        szip::encode_block_szlzrc(src, static_cast<uint32_t>(src_len), cand,
+                                  bias);
+        if (payload.empty() || cand.size() < payload.size())
+          payload.swap(cand);
+      }
+    }
+    if (payload.size() > dst_cap) return SZIP_ERR_BUFFER;
+    std::memcpy(dst, payload.data(), payload.size());
+    *dst_len = payload.size();
+    return SZIP_OK;
+  } catch (const std::bad_alloc &) {
+    return SZIP_ERR_NOMEM;
+  } catch (...) {
+    return SZIP_ERR_NOMEM;
+  }
+}
+
+int szip_decompress_block(const uint8_t *src, size_t src_len, uint8_t *dst,
+                          size_t raw_len) {
+  if (raw_len == 0) return SZIP_OK;
+  if (raw_len > (1u << 24)) return SZIP_ERR_FORMAT;
+  return szip::decode_block_szlzrc(src, src_len, dst,
+                                   static_cast<uint32_t>(raw_len));
+}
+
+uint32_t szip_crc32_update(uint32_t crc, const uint8_t *data, size_t len) {
+  return szip::crc32_table().update(crc, data, len);
+}
+
+uint32_t szip_crc32(const uint8_t *data, size_t len) {
+  return szip::crc32_table().update(0, data, len);
+}
+
+} /* extern "C" */
+// G0D SZIP — engine tests: roundtrips, edge cases, corruption rejection.
+// Built with ASan/UBSan via `make test` flags in the test target below.
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <random>
+#include <string>
+#include <vector>
+
+#include "szip.h"
+
+static int g_failures = 0;
+
+#define CHECK(cond)                                                            \
+  do {                                                                         \
+    if (!(cond)) {                                                             \
+      std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);     \
+      ++g_failures;                                                            \
+    }                                                                          \
+  } while (0)
+
+static std::vector<uint8_t> block_roundtrip(const std::vector<uint8_t> &src,
+                                            int *err_out) {
+  std::vector<uint8_t> comp(szip_compress_bound(src.size()) + 16);
+  size_t clen = 0;
+  int e = szip_compress_block(src.data(), src.size(), comp.data(), comp.size(),
+                              &clen);
+  if (e != SZIP_OK) {
+    *err_out = e;
+    return {};
+  }
+  std::vector<uint8_t> dec(src.size());
+  e = szip_decompress_block(comp.data(), clen, dec.data(), src.size());
+  *err_out = e;
+  if (e != SZIP_OK) return {};
+  return dec;
+}
+
+static void test_rc_and_block_patterns() {
+  int e = 0;
+  // edge sizes
+  for (size_t n = 0; n <= 40; ++n) {
+    std::vector<uint8_t> src(n);
+    for (size_t i = 0; i < n; ++i) src[i] = (uint8_t)(i * 7 + 3);
+    auto dec = block_roundtrip(src, &e);
+    CHECK(e == SZIP_OK);
+    CHECK(dec == src);
+  }
+  // all zeros (RLE-like matches)
+  {
+    std::vector<uint8_t> src(100000, 0);
+    auto dec = block_roundtrip(src, &e);
+    CHECK(e == SZIP_OK);
+    CHECK(dec == src);
+  }
+  // repeated pattern
+  {
+    std::vector<uint8_t> src;
+    const char *pat = "the quick brown fox jumps over the lazy dog. ";
+    for (int i = 0; i < 2000; ++i)
+      for (const char *p = pat; *p; ++p) src.push_back((uint8_t)*p);
+    auto dec = block_roundtrip(src, &e);
+    CHECK(e == SZIP_OK);
+    CHECK(dec == src);
+  }
+  // incompressible random
+  {
+    std::mt19937 rng(42);
+    std::vector<uint8_t> src(50000);
+    for (auto &b : src) b = (uint8_t)rng();
+    auto dec = block_roundtrip(src, &e);
+    CHECK(e == SZIP_OK);
+    CHECK(dec == src);
+  }
+  // two copies (offset match)
+  {
+    std::mt19937 rng(7);
+    std::vector<uint8_t> half(3000);
+    for (auto &b : half) b = (uint8_t)rng();
+    std::vector<uint8_t> src = half;
+    src.insert(src.end(), half.begin(), half.end());
+    auto dec = block_roundtrip(src, &e);
+    CHECK(e == SZIP_OK);
+    CHECK(dec == src);
+  }
+  // long run (overlapping match)
+  {
+    std::vector<uint8_t> src = {'x', 'y', 'z'};
+    src.resize(5000, 'a');
+    auto dec = block_roundtrip(src, &e);
+    CHECK(e == SZIP_OK);
+    CHECK(dec == src);
+  }
+}
+
+static void test_random_roundtrips() {
+  std::mt19937 rng(20261023);
+  for (int iter = 0; iter < 150; ++iter) {
+    const size_t n = rng() % 40000;
+    std::vector<uint8_t> src(n);
+    // mix: some structured, some raw random
+    const int style = iter % 3;
+    for (size_t i = 0; i < n; ++i) {
+      if (style == 0)
+        src[i] = (uint8_t)rng();
+      else if (style == 1)
+        src[i] = (uint8_t)('a' + (rng() % 4));
+      else
+        src[i] = (uint8_t)((rng() & 3) ? (i * 13) : (uint8_t)rng());
+    }
+    int e = 0;
+    auto dec = block_roundtrip(src, &e);
+    CHECK(e == SZIP_OK);
+    CHECK(dec == src);
+    if (g_failures) {
+      std::fprintf(stderr, "  (iter %d n=%zu style=%d)\n", iter, n, style);
+      return;
+    }
+  }
+}
+
+static void test_corruption_rejection() {
+  std::mt19937 rng(99);
+  // Build a valid compressed block of a structured buffer.
+  std::vector<uint8_t> src(20000);
+  for (size_t i = 0; i < src.size(); ++i)
+    src[i] = (uint8_t)((i % 37 == 0) ? 'Z' : (uint8_t)(i & 0xF));
+  std::vector<uint8_t> comp(szip_compress_bound(src.size()) + 16);
+  size_t clen = 0;
+  CHECK(szip_compress_block(src.data(), src.size(), comp.data(), comp.size(),
+                            &clen) == SZIP_OK);
+  comp.resize(clen);
+
+  int accepted = 0, rejected = 0;
+  for (int iter = 0; iter < 300; ++iter) {
+    std::vector<uint8_t> bad = comp;
+    // flip 1-3 random payload bytes
+    const int flips = 1 + (int)(rng() % 3);
+    for (int f = 0; f < flips; ++f)
+      bad[rng() % bad.size()] ^= (uint8_t)(1u << (rng() % 8));
+    std::vector<uint8_t> dec(src.size());
+    const int e = szip_decompress_block(bad.data(), bad.size(), dec.data(),
+                                        src.size());
+    if (e == SZIP_OK) {
+      // decoding garbage to valid-looking output is possible in principle;
+      // it must at least never crash (ASan enforces memory safety).
+      ++accepted;
+    } else {
+      ++rejected;
+    }
+  }
+  std::printf("corruption: %d rejected, %d accepted-by-decoder (CRC is the "
+              "final gate)\n",
+              rejected, accepted);
+  CHECK(rejected > 200); // vast majority must be rejected by the codec itself
+
+  // truncated payload must always be rejected
+  for (size_t cut = 1; cut < comp.size(); cut += 1 + rng() % 5) {
+    std::vector<uint8_t> dec(src.size());
+    const int e = szip_decompress_block(comp.data(), cut, dec.data(),
+                                        src.size());
+    CHECK(e != SZIP_OK);
+  }
+}
+
+static std::string tmp_path(const char *name) {
+  return std::string("build/tmp_") + name;
+}
+
+static void write_file(const std::string &path, const std::vector<uint8_t> &d) {
+  std::ofstream os(path, std::ios::binary | std::ios::trunc);
+  os.write(reinterpret_cast<const char *>(d.data()), (std::streamsize)d.size());
+}
+
+static std::vector<uint8_t> read_file(const std::string &path) {
+  std::ifstream is(path, std::ios::binary);
+  return std::vector<uint8_t>((std::istreambuf_iterator<char>(is)),
+                              std::istreambuf_iterator<char>());
+}
+
+static void file_roundtrip(const std::vector<uint8_t> &data,
+                           uint32_t block_size) {
+  const std::string in = tmp_path("in.bin");
+  const std::string arc = tmp_path("a.szip");
+  const std::string out = tmp_path("out.bin");
+  write_file(in, data);
+  CHECK(szip::compress_file(in, arc, block_size) == SZIP_OK);
+  uint64_t raw = 0;
+  uint32_t crc = 0;
+  CHECK(szip::decompress_file(arc, out, &raw, &crc) == SZIP_OK);
+  CHECK(raw == data.size());
+  CHECK(read_file(out) == data);
+  CHECK(szip::test_file(arc, nullptr) == SZIP_OK);
+}
+
+static void test_container() {
+  // empty file
+  file_roundtrip({}, 1024);
+  // 1 byte
+  file_roundtrip({42}, 1024);
+  // small blocks force multi-block archives
+  std::mt19937 rng(5);
+  std::vector<uint8_t> data(100000);
+  for (size_t i = 0; i < data.size(); ++i)
+    data[i] = (uint8_t)((rng() & 7) ? ('A' + (i % 26)) : rng());
+  file_roundtrip(data, 4096);
+  file_roundtrip(data, 1048576);
+  // pure random (forces stored blocks)
+  std::vector<uint8_t> rnd(300000);
+  for (auto &b : rnd) b = (uint8_t)rng();
+  file_roundtrip(rnd, 65536);
+
+  // integrity: corrupt footer CRC -> must fail
+  {
+    const std::string in = tmp_path("in.bin");
+    const std::string arc = tmp_path("a.szip");
+    write_file(in, data);
+    CHECK(szip::compress_file(in, arc, 4096) == SZIP_OK);
+    auto bytes = read_file(arc);
+    bytes[bytes.size() - 5] ^= 0xFF; // smash CRC
+    write_file(arc, bytes);
+    CHECK(szip::decompress_file(arc, tmp_path("out.bin"), nullptr, nullptr) ==
+          SZIP_ERR_CORRUPT);
+  }
+  // integrity: bad magic -> must fail
+  {
+    auto bytes = read_file(tmp_path("a.szip"));
+    bytes[0] = 'X';
+    write_file(tmp_path("a.szip"), bytes);
+    CHECK(szip::decompress_file(tmp_path("a.szip"), tmp_path("out.bin"),
+                                nullptr, nullptr) == SZIP_ERR_FORMAT);
+  }
+  // integrity: truncation -> must fail
+  {
+    const std::string in = tmp_path("in.bin");
+    const std::string arc = tmp_path("a.szip");
+    write_file(in, data);
+    CHECK(szip::compress_file(in, arc, 4096) == SZIP_OK);
+    auto bytes = read_file(arc);
+    bytes.resize(bytes.size() / 2);
+    write_file(arc, bytes);
+    CHECK(szip::decompress_file(arc, tmp_path("out.bin"), nullptr, nullptr) !=
+          SZIP_OK);
+  }
+}
+
+int main() {
+  // known-answer CRC32: "123456789" -> 0xCBF43926
+  CHECK(szip_crc32(reinterpret_cast<const uint8_t *>("123456789"), 9) ==
+        0xCBF43926u);
+  CHECK(szip_crc32(nullptr, 0) == 0u);
+
+  test_rc_and_block_patterns();
+  std::printf("patterns ok\n");
+  test_random_roundtrips();
+  std::printf("random roundtrips ok\n");
+  test_corruption_rejection();
+  std::printf("corruption rejection ok\n");
+  test_container();
+  std::printf("container ok\n");
+
+  if (g_failures) {
+    std::printf("FAILURES: %d\n", g_failures);
+    return 1;
+  }
+  std::printf("all tests passed\n");
+  return 0;
+}
+// G0D SZIP — IEEE CRC-32 (poly 0xEDB88320). Original implementation.
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+namespace szip {
+
+class Crc32 {
+public:
+  Crc32() {
+    for (uint32_t i = 0; i < 256; ++i) {
+      uint32_t c = i;
+      for (int k = 0; k < 8; ++k)
+        c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+      table_[i] = c;
+    }
+  }
+
+  uint32_t update(uint32_t crc, const uint8_t *data, size_t n) const {
+    crc ^= 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; ++i)
+      crc = table_[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+  }
+
+private:
+  uint32_t table_[256];
+};
+
+inline const Crc32 &crc32_table() {
+  static const Crc32 table;
+  return table;
+}
+
+} // namespace szip
+// G0D SZIP — LZ77 hash-chain match finder. Original implementation.
+#pragma once
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdint>
+#include <vector>
+
+#include "szip.h"
+
+namespace szip {
+
+constexpr uint32_t kMinMatch = SZIP_MIN_MATCH;   // 3
+constexpr uint32_t kMaxMatch = SZIP_MAX_MATCH; // 2048
+constexpr uint32_t kWindowLog = 20;              // 1 MiB
+constexpr uint32_t kWindow = 1u << kWindowLog;
+constexpr uint32_t kHashBits = 18;
+constexpr uint32_t kHashSize = 1u << kHashBits;
+#ifndef SZ_CHAIN
+#define SZ_CHAIN 400
+#endif
+#ifndef SZ_NICE
+#define SZ_NICE 128
+#endif
+constexpr uint32_t kMaxChain = SZ_CHAIN;
+constexpr uint32_t kNiceLen = SZ_NICE;
+
+struct Match {
+  uint32_t len = 0;
+  uint32_t off = 0; // 1-based
+};
+
+class MatchFinder {
+public:
+  // prev_ is indexed modulo the block size; call prepare() once per block.
+  void prepare(uint32_t block_len) {
+    head_.assign(kHashSize, 0);
+    prev_.assign(block_len ? block_len : 1, 0);
+  }
+
+  void insert(const uint8_t *data, uint32_t n, uint32_t pos) {
+    if (pos + kMinMatch > n) return;
+    const uint32_t h = hash3(data + pos);
+    prev_[pos % prev_.size()] = head_[h];
+    head_[h] = pos + 1; // store pos+1 so 0 means empty
+  }
+
+  Match find(const uint8_t *data, uint32_t n, uint32_t pos) const {
+    Match best;
+    int64_t best_score = INT64_MIN;
+    if (pos + kMinMatch > n) return best;
+
+    const uint32_t max_len = std::min<uint32_t>(kMaxMatch, n - pos);
+    const uint32_t limit =
+        (pos > kWindow) ? pos - kWindow : 0;
+
+    uint32_t cand = head_[hash3(data + pos)];
+    for (uint32_t depth = 0; depth < kMaxChain && cand != 0; ++depth) {
+      const uint32_t mpos = cand - 1;
+      if (mpos < limit) break;
+      if (mpos >= pos) {
+        // current position (or lazy look-ahead) is in the chain: skip it
+        cand = prev_[mpos % prev_.size()];
+        continue;
+      }
+
+      // cheap reject: first 3 bytes must match
+      if (data[mpos] != data[pos] || data[mpos + 1] != data[pos + 1] ||
+          data[mpos + 2] != data[pos + 2]) {
+        cand = prev_[mpos % prev_.size()];
+        continue;
+      }
+
+      uint32_t len = 3;
+      while (len < max_len && data[mpos + len] == data[pos + len]) ++len;
+
+      // price-aware: prefer longer matches, but a much nearer match can win
+      const uint32_t off = pos - mpos;
+      uint32_t bl = 0;
+      for (uint32_t t = off; t; t >>= 1) ++bl;
+      const int64_t score = (int64_t)len * 8 - (int64_t)bl * 3;
+      if (best.len == 0 || score > best_score) {
+        best.len = len;
+        best.off = off;
+        best_score = score;
+      }
+      if (len >= kNiceLen || len == max_len) break;
+      cand = prev_[mpos % prev_.size()];
+    }
+    return best;
+  }
+
+private:
+  static uint32_t hash3(const uint8_t *p) {
+    const uint32_t v = static_cast<uint32_t>(p[0]) |
+                       (static_cast<uint32_t>(p[1]) << 8) |
+                       (static_cast<uint32_t>(p[2]) << 16);
+    return (v * 2654435761u) >> (32 - kHashBits);
+  }
+
+  std::vector<uint32_t> head_;
+  std::vector<uint32_t> prev_;
+};
+
+} // namespace szip
+// G0D SZIP — integer context-mixing literal coder (SZLZRC v3 "GOD stage").
+// Original implementation; deterministic fixed-point math only.
+#pragma once
+
+#include <cstdint>
+#include <vector>
+
+#include "rc.hpp"
+#include "tables.hpp"
+
+namespace szip {
+
+#ifndef SZ_WSHIFT
+#define SZ_WSHIFT 13
+#endif
+constexpr int32_t kWShift = SZ_WSHIFT;
+#ifndef SZ_ERRSHIFT
+#define SZ_ERRSHIFT 17
+#endif
+#ifndef SZ_TREESHIFT
+#define SZ_TREESHIFT 5
+#endif
+constexpr int32_t kErrShift = SZ_ERRSHIFT;
+constexpr int32_t kTreeShift = SZ_TREESHIFT;
+#ifndef SZ_WCLAMP
+#define SZ_WCLAMP 20
+#endif
+constexpr int32_t kWClamp = 1 << SZ_WCLAMP;
+
+// Rolling history of the last 5 raw bytes (hist[0] = most recent).
+struct Hist {
+  uint8_t b[5] = {0, 0, 0, 0, 0};
+  uint8_t wpos = 0; // bytes since last space, clamped to 7
+  void push(uint8_t v) {
+    b[4] = b[3];
+    b[3] = b[2];
+    b[2] = b[1];
+    b[1] = b[0];
+    b[0] = v;
+    wpos = (v == 32) ? 0 : (wpos < 7 ? (uint8_t)(wpos + 1) : wpos);
+  }
+};
+
+#ifndef SZ_O3BITS
+#define SZ_O3BITS 17
+#endif
+#ifndef SZ_O4BITS
+#define SZ_O4BITS 17
+#endif
+#ifndef SZ_O5BITS
+#define SZ_O5BITS 17
+#endif
+
+#ifndef SZ_WCTX
+#define SZ_WCTX 64
+#endif
+constexpr uint32_t kWCtx = SZ_WCTX; // 8 (bitpos only) or 64 (x prev band)
+
+#ifndef SZ_ORDER5
+#define SZ_ORDER5 1
+#endif
+
+struct MixLit {
+  std::vector<Prob> t[6];
+  int32_t w[kWCtx][6];
+
+  MixLit() {
+    t[0].assign(32 * 256, static_cast<Prob>(kProbInit));
+    t[1].assign(8192 * 256, static_cast<Prob>(kProbInit));
+    t[2].assign((1u << SZ_O3BITS) * 256, static_cast<Prob>(kProbInit));
+    t[3].assign((1u << SZ_O4BITS) * 256, static_cast<Prob>(kProbInit));
+    if (SZ_ORDER5) t[4].assign((1u << SZ_O5BITS) * 256, static_cast<Prob>(kProbInit));
+    t[5].assign(65536 * 256, static_cast<Prob>(kProbInit)); // (wpos, prev, pprev>>3) word shape
+    for (auto &row : w)
+      for (auto &x : row) x = (1 << kWShift) / 6; // start as equal mix
+  }
+
+#ifndef SZ_WCTX_WPOS
+#define SZ_W_CTX_WPOS 0
+#endif
+  static uint32_t wctx(uint32_t bitpos, const Hist &h) {
+    if (SZ_WCTX <= 8) return bitpos;
+    const uint32_t band = SZ_W_CTX_WPOS ? h.wpos : ((uint32_t)h.b[0] >> 5);
+    return bitpos + 8 * band;
+  }
+
+
+  static uint32_t h1(uint8_t a) { return (uint32_t)a >> 3; }
+  static uint32_t h2(uint8_t a, uint8_t b, uint8_t wp) {
+    return ((uint32_t)a * 2654435761u ^ (uint32_t)b * 40503u ^
+            (uint32_t)wp * 2246822519u) >> 19;
+  }
+  static uint32_t h3(uint8_t a, uint8_t b, uint8_t c, uint8_t wp) {
+    return ((uint32_t)a * 2654435761u ^ (uint32_t)b * 40503u ^
+            (uint32_t)c * 805459861u ^ (uint32_t)wp * 2246822519u) >> (32 - SZ_O3BITS);
+  }
+  static uint32_t h4(uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint8_t wp) {
+    return ((uint32_t)a * 2654435761u ^ (uint32_t)b * 40503u ^
+            (uint32_t)c * 805459861u ^ (uint32_t)d * 1013904223u ^
+            (uint32_t)wp * 2246822519u) >> (32 - SZ_O4BITS);
+  }
+  static uint32_t h5(uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint8_t e,
+                     uint8_t wp) {
+    return ((uint32_t)a * 2654435761u ^ (uint32_t)b * 40503u ^
+            (uint32_t)c * 805459861u ^ (uint32_t)d * 1013904223u ^
+            (uint32_t)e * 2246822519u ^ (uint32_t)wp * 3266489917u) >> (32 - SZ_O5BITS);
+  }
+  static uint32_t hw(const Hist &h) {
+    return (((uint32_t)h.wpos << 13) | ((uint32_t)h.b[0] << 5) | ((uint32_t)h.b[1] >> 3));
+  }
+
+  // p0 = P(bit == 0) in [1, 2047]
+  uint32_t mix(uint32_t wk, const Prob *n0, const Prob *n1, const Prob *n2,
+               const Prob *n3, const Prob *n4, const Prob *n5) const {
+    const int64_t x0 = kStretch[*n0], x1 = kStretch[*n1];
+    const int64_t x2 = kStretch[*n2], x3 = kStretch[*n3];
+    const int64_t x4 = n4 ? kStretch[*n4] : 0;
+    const int64_t x5 = kStretch[*n5];
+    int64_t x = (w[wk][0] * x0 + w[wk][1] * x1 + w[wk][2] * x2 +
+                 w[wk][3] * x3 + w[wk][4] * x4 + w[wk][5] * x5) >>
+                kWShift;
+    if (x > SZIP_SQUASH_BIAS) x = SZIP_SQUASH_BIAS;
+    if (x < -SZIP_SQUASH_BIAS) x = -SZIP_SQUASH_BIAS;
+    return (uint32_t)kSquash[(x + SZIP_SQUASH_BIAS) >> SZIP_SQUASH_SHIFT];
+  }
+
+  void train(uint32_t wk, Prob *n0, Prob *n1, Prob *n2, Prob *n3, Prob *n4,
+             Prob *n5, uint32_t bit, uint32_t p) {
+    if (bit == 0) {
+      *n0 = (Prob)(*n0 + ((2048 - *n0) >> kTreeShift));
+      *n1 = (Prob)(*n1 + ((2048 - *n1) >> kTreeShift));
+      *n2 = (Prob)(*n2 + ((2048 - *n2) >> kTreeShift));
+      *n3 = (Prob)(*n3 + ((2048 - *n3) >> kTreeShift));
+      if (n4) *n4 = (Prob)(*n4 + ((2048 - *n4) >> kTreeShift));
+      *n5 = (Prob)(*n5 + ((2048 - *n5) >> kTreeShift));
+    } else {
+      *n0 = (Prob)(*n0 - (*n0 >> kTreeShift));
+      *n1 = (Prob)(*n1 - (*n1 >> kTreeShift));
+      *n2 = (Prob)(*n2 - (*n2 >> kTreeShift));
+      *n3 = (Prob)(*n3 - (*n3 >> kTreeShift));
+      if (n4) *n4 = (Prob)(*n4 - (*n4 >> kTreeShift));
+      *n5 = (Prob)(*n5 - (*n5 >> kTreeShift));
+    }
+    const int32_t err = (int32_t)(bit == 0 ? 2048 - p : 0 - p);
+    const int64_t xs[6] = {kStretch[*n0], kStretch[*n1], kStretch[*n2],
+                           kStretch[*n3], n4 ? kStretch[*n4] : 0,
+                           kStretch[*n5]};
+    for (int i = 0; i < 6; ++i) {
+      int32_t nw = w[wk][i] + (int32_t)((err * xs[i]) >> kErrShift);
+      if (nw > kWClamp) nw = kWClamp;
+      if (nw < -kWClamp) nw = -kWClamp;
+      w[wk][i] = nw;
+    }
+  }
+
+  // Update models for one raw byte (no coding). Called for bytes covered by
+  // matches too, so prices stay calibrated.
+  void train_byte(Hist &h, uint8_t b) {
+    const uint32_t c0 = h1(h.b[0]), c1 = h2(h.b[0], h.b[1], h.wpos);
+    const uint32_t c2 = h3(h.b[0], h.b[1], h.b[2], h.wpos);
+    const uint32_t c3 = h4(h.b[0], h.b[1], h.b[2], h.b[3], h.wpos);
+    const uint32_t c5 = SZ_ORDER5 ? h5(h.b[0], h.b[1], h.b[2], h.b[3], h.b[4], h.wpos) : 0;
+    const uint32_t cw = hw(h);
+    uint32_t sym = 1;
+    for (int k = 7; k >= 0; --k) {
+      const uint32_t bit = (b >> k) & 1;
+      Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][c1 * 256 + sym];
+      Prob *n2 = &t[2][c2 * 256 + sym], *n3 = &t[3][c3 * 256 + sym];
+      Prob *n4 = SZ_ORDER5 ? &t[4][c5 * 256 + sym] : nullptr;
+      Prob *n5 = &t[5][cw * 256 + sym];
+      const uint32_t wk = wctx((uint32_t)(7 - k), h);
+      const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5);
+      train(wk, n0, n1, n2, n3, n4, n5, bit, p);
+      sym = (sym << 1) | bit;
+    }
+    h.push(b);
+  }
+
+  void encode(RcEncoder &rc, Hist &h, uint8_t b) {
+    const uint32_t c0 = h1(h.b[0]), c1 = h2(h.b[0], h.b[1], h.wpos);
+    const uint32_t c2 = h3(h.b[0], h.b[1], h.b[2], h.wpos);
+    const uint32_t c3 = h4(h.b[0], h.b[1], h.b[2], h.b[3], h.wpos);
+    const uint32_t c5 = SZ_ORDER5 ? h5(h.b[0], h.b[1], h.b[2], h.b[3], h.b[4], h.wpos) : 0;
+    const uint32_t cw = hw(h);
+    uint32_t sym = 1;
+    for (int k = 7; k >= 0; --k) {
+      const uint32_t bit = (b >> k) & 1;
+      Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][c1 * 256 + sym];
+      Prob *n2 = &t[2][c2 * 256 + sym], *n3 = &t[3][c3 * 256 + sym];
+      Prob *n4 = SZ_ORDER5 ? &t[4][c5 * 256 + sym] : nullptr;
+      Prob *n5 = &t[5][cw * 256 + sym];
+      const uint32_t wk = wctx((uint32_t)(7 - k), h);
+      const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5);
+      rc.encode_bit_p(p, bit);
+      train(wk, n0, n1, n2, n3, n4, n5, bit, p);
+      sym = (sym << 1) | bit;
+    }
+    h.push(b);
+  }
+
+  uint8_t decode(RcDecoder &rc, Hist &h) {
+    const uint32_t c0 = h1(h.b[0]), c1 = h2(h.b[0], h.b[1], h.wpos);
+    const uint32_t c2 = h3(h.b[0], h.b[1], h.b[2], h.wpos);
+    const uint32_t c3 = h4(h.b[0], h.b[1], h.b[2], h.b[3], h.wpos);
+    const uint32_t c5 = SZ_ORDER5 ? h5(h.b[0], h.b[1], h.b[2], h.b[3], h.b[4], h.wpos) : 0;
+    const uint32_t cw = hw(h);
+    uint32_t sym = 1;
+    for (int k = 0; k < 8; ++k) {
+      Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][c1 * 256 + sym];
+      Prob *n2 = &t[2][c2 * 256 + sym], *n3 = &t[3][c3 * 256 + sym];
+      Prob *n4 = SZ_ORDER5 ? &t[4][c5 * 256 + sym] : nullptr;
+      Prob *n5 = &t[5][cw * 256 + sym];
+      const uint32_t wk = wctx((uint32_t)k, h);
+      const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5);
+      const uint32_t bit = rc.decode_bit_p(p);
+      train(wk, n0, n1, n2, n3, n4, n5, bit, p);
+      sym = (sym << 1) | bit;
+    }
+    return (uint8_t)(sym & 0xFFu);
+  }
+
+  // Cost in 1/16 bits of coding `b` from history `h` (no state change).
+  uint32_t peek(const Hist &h, uint8_t b) const {
+    const uint32_t c0 = h1(h.b[0]), c1 = h2(h.b[0], h.b[1], h.wpos);
+    const uint32_t c2 = h3(h.b[0], h.b[1], h.b[2], h.wpos);
+    const uint32_t c3 = h4(h.b[0], h.b[1], h.b[2], h.b[3], h.wpos);
+    const uint32_t c5 = SZ_ORDER5 ? h5(h.b[0], h.b[1], h.b[2], h.b[3], h.b[4], h.wpos) : 0;
+    const uint32_t cw = hw(h);
+    uint32_t sym = 1, price = 0;
+    for (int k = 7; k >= 0; --k) {
+      const uint32_t bit = (b >> k) & 1;
+      const Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][c1 * 256 + sym];
+      const Prob *n2 = &t[2][c2 * 256 + sym], *n3 = &t[3][c3 * 256 + sym];
+      const Prob *n4 = SZ_ORDER5 ? &t[4][c5 * 256 + sym] : nullptr;
+      const Prob *n5 = &t[5][cw * 256 + sym];
+      const uint32_t wk = wctx((uint32_t)(7 - k), h);
+      const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5);
+      price += kBitPrice[bit == 0 ? p : 2048 - p];
+      sym = (sym << 1) | bit;
+    }
+    return price;
+  }
+
+  uint32_t peek_span(const Hist &h, const uint8_t *src, uint32_t pos,
+                     uint32_t len) const {
+    Hist hh = h;
+    uint32_t price = 0;
+    for (uint32_t i = 0; i < len; ++i) {
+      price += peek(hh, src[pos + i]);
+      hh.push(src[pos + i]);
+    }
+    return price;
+  }
+};
+
+} // namespace szip
+// G0D SZIP — adaptive binary range coder (carryless, 11-bit probabilities).
+// Original implementation for SuperZip; no third-party code.
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+namespace szip {
+
+using Prob = uint16_t;
+
+constexpr uint32_t kProbInit = 1024; // 50% prior
+constexpr uint32_t kProbBits = 11;
+constexpr uint32_t kProbMoveBits = 5;
+constexpr uint32_t kTop = 1u << 24;
+
+class RcEncoder {
+public:
+  explicit RcEncoder(std::vector<uint8_t> &out) : out_(out) {}
+
+  uint64_t bits = 0;
+
+  void encode_bit(Prob &p, uint32_t bit) {
+    ++bits;
+    const uint32_t bound = (range_ >> kProbBits) * static_cast<uint32_t>(p);
+    if (bit == 0) {
+      range_ = bound;
+      p = static_cast<Prob>(p + ((2048u - p) >> kProbMoveBits));
+    } else {
+      low_ += bound;
+      range_ -= bound;
+      p = static_cast<Prob>(p - (p >> kProbMoveBits));
+    }
+    while (range_ < kTop) {
+      range_ <<= 8;
+      shift_low();
+    }
+  }
+
+  void flush() {
+    for (int i = 0; i < 5; ++i) shift_low();
+  }
+
+  // Encode with an external probability (no prob update); p in [1, 2047]
+  // is P(bit == 0).
+  void encode_bit_p(uint32_t p, uint32_t bit) {
+    ++bits;
+    const uint32_t bound = (range_ >> kProbBits) * p;
+    if (bit == 0) {
+      range_ = bound;
+    } else {
+      low_ += bound;
+      range_ -= bound;
+    }
+    while (range_ < kTop) {
+      range_ <<= 8;
+      shift_low();
+    }
+  }
+
+private:
+  void shift_low() {
+    const uint32_t high = static_cast<uint32_t>(low_ >> 32);
+    if (static_cast<uint32_t>(low_) < 0xFF000000u || high != 0) {
+      uint8_t temp = cache_;
+      do {
+        out_.push_back(static_cast<uint8_t>(temp + static_cast<uint8_t>(high)));
+        temp = 0xFF;
+      } while (--cache_size_ != 0);
+      cache_ = static_cast<uint8_t>(static_cast<uint32_t>(low_) >> 24);
+    }
+    ++cache_size_;
+    low_ = static_cast<uint64_t>(static_cast<uint32_t>(low_) << 8);
+  }
+
+  std::vector<uint8_t> &out_;
+  uint64_t low_ = 0;
+  uint32_t range_ = 0xFFFFFFFFu;
+  uint8_t cache_ = 0;
+  uint64_t cache_size_ = 1;
+};
+
+class RcDecoder {
+public:
+  RcDecoder(const uint8_t *in, size_t n) : in_(in), in_size_(n) {}
+
+  // Reads the 5-byte prologue (first byte must be 0). False on truncation.
+  bool init() {
+    if (in_size_ < 5) return false;
+    if (in_[0] != 0) return false;
+    in_pos_ = 1;
+    code_ = 0;
+    for (int i = 0; i < 4; ++i) code_ = (code_ << 8) | next_byte();
+    return ok_;
+  }
+
+  uint32_t decode_bit(Prob &p) {
+    const uint32_t bound = (range_ >> kProbBits) * static_cast<uint32_t>(p);
+    uint32_t bit;
+    if (code_ < bound) {
+      range_ = bound;
+      p = static_cast<Prob>(p + ((2048u - p) >> kProbMoveBits));
+      bit = 0;
+    } else {
+      code_ -= bound;
+      range_ -= bound;
+      p = static_cast<Prob>(p - (p >> kProbMoveBits));
+      bit = 1;
+    }
+    while (range_ < kTop) {
+      range_ <<= 8;
+      code_ = (code_ << 8) | next_byte();
+    }
+    return bit;
+  }
+
+  // Decode with an external probability (no prob update); p in [1, 2047]
+  // is P(bit == 0).
+  uint32_t decode_bit_p(uint32_t p) {
+    const uint32_t bound = (range_ >> kProbBits) * p;
+    uint32_t bit;
+    if (code_ < bound) {
+      range_ = bound;
+      bit = 0;
+    } else {
+      code_ -= bound;
+      range_ -= bound;
+      bit = 1;
+    }
+    while (range_ < kTop) {
+      range_ <<= 8;
+      code_ = (code_ << 8) | next_byte();
+    }
+    return bit;
+  }
+
+  bool ok() const { return ok_; }
+  size_t pos() const { return in_pos_; }
+
+private:
+  uint8_t next_byte() {
+    if (in_pos_ >= in_size_) {
+      ok_ = false;
+      return 0;
+    }
+    return in_[in_pos_++];
+  }
+
+  const uint8_t *in_;
+  size_t in_size_;
+  size_t in_pos_ = 0;
+  uint32_t range_ = 0xFFFFFFFFu;
+  uint32_t code_ = 0;
+  bool ok_ = true;
+};
+
+} // namespace szip
+/* G0D SZIP — C ABI for the SZLZRC block engine (SuperZip project).
+ * Own encoder/decoder, no third-party compression code.
+ */
+#ifndef SZIP_H
+#define SZIP_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Error codes (shared with the Rust engines). */
+#define SZIP_OK 0
+#define SZIP_ERR_IO (-1)
+#define SZIP_ERR_FORMAT (-2)
+#define SZIP_ERR_CORRUPT (-3)
+#define SZIP_ERR_UNSUPPORTED (-4)
+#define SZIP_ERR_NOMEM (-5)
+#define SZIP_ERR_TRUNCATED (-6)
+#define SZIP_ERR_BUFFER (-7)
+
+/* Container constants. */
+#define SZIP_VERSION 3
+#define SZIP_MAGIC0 0x53 /* 'S' */
+#define SZIP_MAGIC1 0x5A /* 'Z' */
+#define SZIP_MAGIC2 0x50 /* 'P' */
+#define SZIP_MAGIC3 0x31 /* '1' */
+#define SZIP_HEADER_SIZE 20
+#define SZIP_FOOTER_SIZE 8
+#define SZIP_BLOCK_HEADER_SIZE 10
+#define SZIP_BLOCK_STORED 0
+#define SZIP_BLOCK_SZLZRC 1
+#define SZIP_DEFAULT_BLOCK_SIZE (1u << 20)
+
+/* Codec limits (SZLZRC v1). */
+#define SZIP_MIN_MATCH 3
+#define SZIP_MAX_MATCH 2048
+#define SZIP_MAX_OFFSET (1u << 20)
+
+/* Upper bound for the compressed size of `raw_len` bytes. */
+size_t szip_compress_bound(size_t raw_len);
+
+/* Compress one block. dst_len receives the payload size written to dst.
+ * Returns SZIP_OK, SZIP_ERR_BUFFER if dst_cap is too small. */
+int szip_compress_block(const uint8_t *src, size_t src_len, uint8_t *dst,
+                        size_t dst_cap, size_t *dst_len);
+
+/* Decompress one SZLZRC block. `raw_len` is the expected raw size from the
+ * block header. Returns SZIP_OK, or a negative error for corrupt input. */
+int szip_decompress_block(const uint8_t *src, size_t src_len, uint8_t *dst,
+                          size_t raw_len);
+
+/* IEEE CRC-32 (poly 0xEDB88320). */
+uint32_t szip_crc32(const uint8_t *data, size_t len);
+uint32_t szip_crc32_update(uint32_t crc, const uint8_t *data, size_t len);
+
+#ifdef __cplusplus
+} /* extern "C" */
+
+#include <string>
+#include <vector>
+
+namespace szip {
+
+/* ---- container (.szip file layout) — C++ reference implementation ---- */
+
+struct Header {
+  uint32_t block_size = SZIP_DEFAULT_BLOCK_SIZE;
+  uint64_t total_raw = 0;
+};
+
+int compress_file(const std::string &in_path, const std::string &out_path,
+                  uint32_t block_size = SZIP_DEFAULT_BLOCK_SIZE);
+int decompress_file(const std::string &in_path, const std::string &out_path,
+                    uint64_t *raw_out = nullptr, uint32_t *crc_out = nullptr);
+int test_file(const std::string &in_path, uint64_t *raw_out = nullptr);
+
+} /* namespace szip */
+#endif /* __cplusplus */
+
+#endif /* SZIP_H */
+# G0D SZIP — `.szip` Container Format (v3)
+
+Reference project: **SuperZip / G0D SZIP**. This document is normative for the
+byte layout of `.szip` archives and the SZLZRC v3 bitstream.
+
+Design goals:
+
+1. **Own everything** — encoder, decoder, entropy coder, match finder and CRC
+   are original implementations (C++ engine `native/` and Rust engine
+   `rust/szip-core/`). No third-party compression code.
+2. **Deterministic** — same input + same settings ⇒ byte-identical output.
+3. **Hostile-input safe** — every length is validated; the decoder never reads
+   or writes out of bounds.
+4. **Extensible** — codec IDs and block framing allow future "GOD stages"
+   without breaking v3 files.
+
+All multi-byte integers are **little-endian**. All arithmetic below is exact;
+where machine integer wraparound is intended it is written `mod 2^32`.
+
+---
+
+## 1. File layout
+
+```
+header (20 bytes) | block* | footer (8 bytes)
+```
+
+### 1.1 Header (20 bytes)
+
+| off | size | field |
+|-----|------|-------|
+| 0   | 4    | magic `"SZP1"` |
+| 4   | 1    | `version` = `3` |
+| 5   | 1    | flags (bit0 = stream CRC present; always 1) |
+| 6   | 2    | reserved, zero |
+| 8   | 8    | `raw_size` (total uncompressed bytes, LE u64) |
+
+### 1.2 Block framing
+
+Each block: `type` (1 byte), `pad` (1 byte, zero), `comp_size` (LE u24,
+bytes after the 4-byte prefix), payload (`comp_size` bytes).
+
+| type | codec |
+|------|-------|
+| 0    | stored (raw copy) |
+| 1    | SZLZRC v3 payload |
+| other| reserved |
+
+Sum of block `raw_size` fields must equal the header `raw_size`.
+
+### 1.3 Footer (8 bytes)
+
+`stream_crc` (LE u32, CRC-32/ISO-HDLC of the raw stream) and `reserved`
+(LE u32, zero).
+
+---
+
+## 2. Block codec: SZLZRC v3 (`type = 1`)
+
+**S**uper**Z**ip **LZ**77 + **R**ange **C**oder + context mixing, v3.
+
+Pipeline: LZ77 factorization (hash chains, price-aware parse, 1 MiB window,
+last-3 rep offsets) → token stream → adaptive binary range coder (carryless,
+11-bit probabilities). **Literals** are bit-coded through the integer
+context-mixing model of §2.4 ("GOD stage"); token syntax and match/rep coding
+are as in SZLZRC v2.
+
+### 2.1 Range coder
+
+State: `low` (u64), `range` (u32, init `0xFFFFFFFF`), `code` (u32, decoder).
+
+Bit coding with probability `p` (u16, init `1024`, updated with shift 5):
+
+```
+bound = (range >> 11) * p
+bit 0:  range = bound;         p += (2048 - p) >> 5
+bit 1:  low += bound; range -= bound; p -= p >> 5   (decoder: code -= bound)
+normalize while range < 2^24:  range <<= 8; emit/consume one byte
+```
+
+Encoder writes a 5-byte flush tail (`shiftLow` x5). The decoder pre-reads 5
+bytes (first must be `0`) and must finish having consumed the payload exactly.
+
+**Fixed-probability bits** (used by the literal mixer): identical bound
+arithmetic, but `p` is supplied externally and is *not* updated by the coder.
+`p` is the probability that the bit is `0`, in `[1, 2047]`.
+
+### 2.2 Token models (all u16, init `1024`, self-updating as in §2.1)
+
+- `is_match` — literal vs match flag
+- `is_rep` — rep match vs normal match
+- `rep_sel[2]` — rep index: bit0 `0`→rep0, `1`→rep1/2; bit1 `0`→rep1, `1`→rep2
+- `len_unary[12]`, `len_bits[10]` — Elias gamma of `len - 2`
+- `off_mode` — offset mode flag
+- `tiny_unary[8]`, `tiny_bits[8]` — Elias gamma of `off` (tiny mode)
+- `slot_unary[12]`, `slot_bits[10]` — Elias gamma of `n - 2` (slot mode)
+- `off_direct[19]` — mantissa bits of `off - 1`
+
+Elias gamma value `x >= 1`, `n = floor(log2 x)`: `n` one-bits, one zero-bit,
+then the `n` low bits of `x` MSB-first. Each position `i` uses its own
+adaptive probability (`unary[i]`, `bits[i]`).
+
+### 2.3 Token stream
+
+Decoder state: history `hist` (last 5 raw bytes, all `0` initially, plus
+`wpos` = bytes since the last space byte `0x20`, clamped to `7`, init `0`),
+`rep0,rep1,rep2` (1-based offsets, `0` = none), all zero initially.
+
+```
+repeat until raw_size bytes are produced:
+  is_match?
+  0 -> literal:
+       byte = MIXDECODE(hist)                      (section 2.4)
+       push(hist, byte)
+  1 -> is_rep?
+       1 -> rep match:
+            rep_sel bits select idx in {0,1,2}
+            len  = gamma(len_unary/len_bits) + 2      in [3, 2048]
+            offset = rep[idx]                          (must be != 0, <= out_pos)
+            rep update: if idx > 0 { tmp=rep[idx]; shift; rep0=tmp }
+       0 -> normal match:
+            offset code (below)
+            len  = gamma(len_unary/len_bits) + 2      in [3, 2048]
+            rep update: rep2=rep1; rep1=rep0; rep0=offset
+       copy len bytes from out_pos - offset (overlap allowed)
+       for each copied byte b in order: MIXTRAIN(hist, b); push(hist, b)
+```
+
+`push(hist, b)`: `hist.b[4..1] = hist.b[3..0]; hist.b[0] = b;` then
+`wpos = (b == 32) ? 0 : min(wpos + 1, 7)`.
+
+**Offset code** (`u = off - 1`, `n = bitlen(u)`):
+
+- `u < 4` (off 1..4): `off_mode = 0`, then `gamma(off)`
+- else: `off_mode = 1`, then `gamma(n - 2)`, then `n - 1` mantissa bits of `u`
+  (bit `i` coded with `off_direct[i]`, `i` from `n-2` down to `0`; the top bit
+  of `u` is implicitly `1`)
+
+`off` must decode to `[1, 2^20]`.
+
+### 2.4 Literal mixer ("GOD stage", normative)
+
+All probabilities below are integers in `[1, 2047]` (11-bit, `1024` = 50%).
+All hashing multiplies are `uint32` (`mod 2^32`); `>>` on negative values is
+an arithmetic shift.
+
+**Fixed-point tables** (generated; reference implementation
+`native/tables.hpp`, `rust/szip-core/src/tables.rs`):
+
+- `STRETCH[2048]` (i32): `STRETCH[p] = clamp(round(log2(p/(2048-p)) * 4096),
+  -45056, 45056)` for `p` in 1..2047, `STRETCH[0] = -45056`.
+- `SQUASH[5633]` (i16): `SQUASH[i] = clamp(round(2048 / (1 + 2^(-x/4096))),
+  1, 2047)` with `x = i*16 - 45056`.
+- `BIT_PRICE[2049]` (u16): `BIT_PRICE[p] = clamp(round(-log2(p/2048) * 16),
+  1, 2048)` (1/16-bit units; encoder-only).
+
+**Model state**: six binary trees `t0..t5`, each `num_ctx × 256` u16 nodes
+indexed `[ctx * 256 + sym]`, `sym` in 1..255 during the walk (leaf `sym = 0`
+is never indexed). All nodes init `1024`.
+
+Contexts at literal time (`b0..b4 = hist.b[0..4]`, `wp = wpos`):
+
+```
+c0 = b0 >> 3                                             (32 ctx)
+c1 = (b0*2654435761 ^ b1*40503 ^ wp*2246822519) >> 19     (8192 ctx)
+c2 = (b0*2654435761 ^ b1*40503 ^ b2*805459861 ^ wp*2246822519) >> 15
+c3 = (b0*2654435761 ^ b1*40503 ^ b2*805459861 ^ b3*1013904223 ^ wp*2246822519) >> 15
+c4 = (b0*2654435761 ^ b1*40503 ^ b2*805459861 ^ b3*1013904223
+      ^ b4*2246822519 ^ wp*3266489917) >> 15               (131072 ctx)
+c5 = (wp << 13) | (b0 << 5) | (b1 >> 3)                   (65536 ctx)
+```
+
+Tree sizes: `t0` 32, `t1` 8192, `t2` 131072, `t3` 131072, `t4` 131072,
+`t5` 65536 contexts.
+
+**Mixer**: weights `w[64][6]` (i32), all init `1365` (= `2^13 / 6`, equal
+mix). Weight context `wk = bitpos + 8 * (b0 >> 5)` where `bitpos` counts the
+coded bits of the byte MSB-first: the first bit (bit 7) uses `bitpos = 0`,
+…, the last (bit 0) uses `bitpos = 7`.
+
+Per bit of a literal byte, `sym` starting at 1 (MSB first, `bit` is the bit):
+
+```
+p_i   = t_i[ctx_i * 256 + sym]                 (p_4 valid only if tree exists)
+x     = Σ_i w[wk][i] * STRETCH[p_i]            >> 13  (arithmetic)
+x     = clamp(x, -45056, 45056)
+p_mix = SQUASH[(x + 45056) >> 4]
+RC fixed-prob bit with p = p_mix               (MIXDECODE reads the bit here)
+// updates, in this exact order:
+if bit == 0:  p_i += (2048 - p_i) >> 5         for every tree i
+else:         p_i -= p_i >> 5
+err = bit == 0 ? 2048 - p_mix : -p_mix
+for i in 0..5:
+    w[wk][i] = clamp(w[wk][i] + ((err * STRETCH[p_i_after_update]) >> 17),
+                     -2^20, 2^20)
+sym = (sym << 1) | bit
+```
+
+`MIXTRAIN(hist, b)` performs the same per-bit walk and updates (trees and
+weights) with `bit` taken from `b`, without touching the range coder; it does
+not push `hist` (the caller does). Encoder and decoder must call
+`MIXTRAIN` for every match-covered byte so both stay in lock-step.
+
+### 2.5 Encoder parse (advice; decoder-agnostic)
+
+The parse policy is **not** part of the bitstream contract — any factorization
+respecting the grammar decodes correctly. For deterministic output and
+reference ratios, the shipped encoders use:
+
+- Match finder: 3-byte hash (`v * 2654435761 >> 14`), 18-bit table, hash
+  chains, window `2^20`, chain depth `400`, max match `2048`, nice length
+  `128`. Candidate selection is price-aware: score `= len*8 - bitlen(off)*3`,
+  highest wins.
+- At each position the encoder also measures rep matches against the current
+  `rep0..2` (longest wins; lowest index on ties).
+- Rep vs normal: rep wins if longer; otherwise by price
+  `3 + gamma_price(len_r - 2) + 5*(len_n - len_r) < gamma_price(off) +
+  gamma_price(len_n - 2)` where `gamma_price(x) = 2*floor(log2 x) + 1`.
+- A match is rejected (encoded as literals) when
+  `est * bias > lit_peek` where `est` is the estimated token price in bits,
+  `lit_peek` is the mixer's price in 1/16 bits of coding the same span as
+  literals (§2.4 `BIT_PRICE`, evaluated read-only), and `bias` is a tuning
+  constant.
+- Multi-parse: the encoder tries `bias ∈ {13, 16, 20}`, keeps the smallest
+  payload. The decoder cannot observe which parse produced a stream.
+- One-step lazy: if the best match at `pos+1` is longer than the one at `pos`
+  (by at least 1), emit a literal at `pos`.
+
+### 2.6 Stored blocks (`type = 0`)
+
+Raw bytes verbatim. The encoder picks stored whenever the compressed payload
+would not be smaller than `raw_size` (incompressible data never expands).
+
+---
+
+## 3. Integrity
+
+The decoder rejects: bad magic/version, truncation, `raw_size`/`comp_size`
+violations, range-coder over/under-consumption, invalid offsets/lengths, and a
+footer CRC mismatch. A corrupted archive must never cause out-of-bounds access.
+
+## 4. Versioning
+
+`version = 1` (2026-10-23, pre-release) used SZLZRC v1 (no rep offsets, plain
+gamma offsets). `version = 2` used SZLZRC v2 (rep offsets + price-aware
+parse + order-1 literal trees). Both are rejected by the version field.
+`version = 3` replaces literal coding with the §2.4 context mixer; token
+syntax is unchanged from v2. Future GOD stages get new block `type` IDs or a
+`version = 4` bump.
+# G0D SZIP (SuperZip)
+
+Compress files nicely. Format `.szip`.
+
+**G0D SZIP** is a from-scratch compression project with **two complete
+implementations of one format**, merged into one toolchain:
+
+| layer | C++ engine (`native/`) | Rust engine (`rust/szip-core/`) |
+|---|---|---|
+| LZ77 match finder | ✅ own | ✅ own |
+| adaptive range coder | ✅ own | ✅ own |
+| CRC-32 | ✅ own | ✅ own |
+| `.szip` container | ✅ own | ✅ own |
+| CLI | `build/g0dszip` | `g0dszip`, `g0dszip-cpp` |
+
+No third-party compression code anywhere — no zlib, zstd, lz4, brotli or any
+other library. The two engines are byte-compatible twins: same format
+([docs/SZIP_FORMAT.md](docs/SZIP_FORMAT.md)), deterministic output, and the
+Rust `szip-sys` crate merges the C++ engine into Rust through a C ABI.
+
+## Layout
+
+```
+native/            C++17 engine: range coder, LZ77, CRC32, codec, CLI
+rust/szip-core/    pure-Rust engine (std only, zero dependencies)
+rust/szip-sys/     FFI bridge: builds native/ with g++/ar, exposes C ABI
+rust/g0dszip/      CLI — Rust engine
+rust/g0dszip-cpp/  CLI — Rust container + C++ codec (the merge)
+docs/              format specification
+tests/             cross-engine compatibility checks
+```
+
+## Build & test
+
+```sh
+make            # builds build/g0dszip (C++ engine)
+make test       # C++ engine tests (ASan/UBSan) + cross-engine checks
+
+cd rust
+cargo build --release   # needs a Rust toolchain + g++
+cargo test              # Rust engine unit tests + C++ engine via FFI
+```
+
+`tests/crosscheck.sh` proves all three engines round-trip each other's
+archives **and produce byte-identical output**.
+
+## Usage
+
+```sh
+g0dszip c [-b blocksize] input output.szip   # compress
+g0dszip d input.szip output                  # decompress
+g0dszip t input.szip                         # verify (CRC32 + structure)
+g0dszip i input.szip                         # info
+```
+
+## Codec: SZLZRC v3 ("GOD stage")
+
+**S**uper**Z**ip **LZ**77 + **R**ange **C**oder + integer context mixing —
+block-based (default 1 MiB), price-aware hash-chain matching (up to 2 KiB
+matches, 1 MiB window), last-3 rep-offsets, Elias-gamma length/offset coding
+with tiny-offset and slot modes. Literals go through a **PAQ-style integer
+context mixer**: six binary probability trees (orders 0–5, word-shape model)
+combined per bit by fixed-point weights, refined with generated
+stretch/squash/price tables — all our own code, deterministic, no floats.
+Incompressible blocks are stored verbatim, so `.szip` never expands data.
+
+Measured on this project's benchmark corpora (ratio = compressed/raw, lower
+is better; `tests/mkcorpus.sh` regenerates them; random data is stored so it
+never expands):
+
+| corpus | **G0D SZIP v3** | gzip-9 | bzip2-9 | xz-9e |
+|---|---|---|---|---|
+| source code (65,036 B) | **24.849%** (16,161 B) | 26.072% | 24.851% | 24.091% |
+| word-salad text (500,003 B) | **10.659%** (53,295 B) | 17.309% | 10.791% | 15.353% |
+| random (500,000 B) | **100.008%** (500,038 B) | 100.023% | 100.544% | 100.017% |
+
+**G0D SZIP beats bzip2-9 on all three corpora and beats xz-9e on text and
+random.** On source code xz-9e is still ahead (by 3.1%); that is the next
+target (optimal parsing). Evolution: v2 scored 26.3%/17.2% on the old
+45 KB/500 KB corpora — the v3 mixer cut text by another ~38% relative.
+
+## Safety
+
+Decompressors parse attacker-controlled bytes. Both engines validate every
+length/offset, never trust the framing, and the C++ engine is continuously
+fuzz-shaped by ASan/UBSan roundtrips plus a corruption battery (bit-flips,
+truncations, bad magic must be rejected).

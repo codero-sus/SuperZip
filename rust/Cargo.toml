@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["szip-core", "szip-sys", "g0dszip", "g0dszip-cpp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
