@@ -156,15 +156,20 @@ every compressed archive — html and sparse flipped to wins). Incompressible
 input stays bare (4-byte container + raw), so random data beats even
 brotli's stored framing by one byte and `.szip` never expands data.
 
-**Speed (the v7 rewrite)**: one refined parse emits all four modes (the
-modes differ only in pricing), trial lengths are bounded and long matches
-are taken whole, prices are lazily cached per position, the BWT family
-runs 5-way parallel with a gap-entropy prefilter, and the finder chain is
-capped. Result: **2.4-5.9 s to encode a 128 KiB corpus, 12.6 s for the
-500 KB text corpus** (5.8 s worst-case on the 278 KB src tree); `--fast`/
-GUI toggle halves that again (7.8 s on 500 KB text, same size there).
-Decode is single-pass: 0.2-0.4 s. gzip/xz remain faster encoders at far
-worse ratios; G0D SZIP trades encode search for wins on 14 of 20 types.
+**Speed (the ULTRA pass)**: the engine keeps its 14-win sizes **byte-for-byte**
+(golden-checked against the previous build on all 20 corpora) and gets there
+faster: the match finder runs a sequential hash-link pass plus a parallel
+walk/verify phase (match extension is word-at-a-time, the per-step integer
+divide is gone), the BWT/delta family overlaps the parse chain on the spare
+core, DP insert rejection is O(1) via an exact worst-cost cache, and
+multi-block archives encode/decode blocks in parallel with ordered output.
+Measured on 2 cores (best-of-2, `python3 tests/benchall.py` timings): **1.40x
+faster end-to-end** — sparse **3.5x** (7.4 s -> 2.1 s), html 1.5x, log/json
+~1.5x, text 9.7 -> 7.2 s, code 2.5 -> 1.8 s; rows where BWT entropy coding
+dominates (pcm) stay ~1.0x. `--fast`/the GUI toggle halves parse work again.
+Decode is single-pass 0.2-0.4 s and scales with block count. gzip/xz remain
+faster encoders at far worse ratios; G0D SZIP trades encode search for wins
+on 14 of 20 types.
 
 What remains: **dict** (brotli's static-model niche, −19%), **floats**
 (xz's filters own structured high-entropy binary; the ARF float coder is
