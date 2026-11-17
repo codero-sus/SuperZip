@@ -1,7 +1,7 @@
-# G0D SZIP — `.szip` Container Format (v6)
+# G0D SZIP — `.szip` Container Format (v7)
 
 Reference project: **SuperZip / G0D SZIP**. This document is normative for the
-byte layout of `.szip` archives and the SZLZRC v3 bitstream.
+byte layout of `.szip` archives and the SZLZRC v7 bitstream.
 
 Design goals:
 
@@ -21,44 +21,46 @@ where machine integer wraparound is intended it is written `mod 2^32`.
 
 ## 1. File layout
 
+A v7 archive is one of three forms, chosen by the 4th magic byte:
+
+| byte 3 | form | written when |
+|--------|------|--------------|
+| `0x40 \| ver` | **compact v7 container** (this section) | compression saved ≥ 12 bytes |
+| `0x80 \| ver` | **bare stored form** (§1.2) | incompressible / savings < 12 bytes |
+| `0x31` (ver 4–6) | **legacy container** (§1.3) | never written; read-only support |
+
+Decoders route on the flags: bit 7 set ⇒ bare; bit 6 set ⇒ compact; exact
+`0x31` ⇒ legacy. Bit 7 and bit 6 are mutually exclusive.
+
+### 1.1 Compact v7 container (default)
+
 ```
-header (20 bytes) | block* | footer (8 bytes)
+magic (4 bytes) | block* | stream CRC32 (4 bytes, LE) at EOF
 ```
 
-### 1.1 Header (20 bytes)
-
-| off | size | field |
-|-----|------|-------|
-| 0   | 4    | magic `"SZP1"` |
-| 4   | 1    | `version` = `6` (v4 and v5 headers are also accepted) |
-| 5   | 1    | flags (reserved, zero) |
-| 6   | 2    | reserved, zero |
-| 8   | 4    | `block_size` (max block raw size, LE u32) |
-| 12  | 8    | `total_raw` (total uncompressed bytes, LE u64) |
-
-### 1.2 Block framing
-
-Each block header (10 bytes, LE): `type` (1), `pad` (1, zero), `raw_size` (4),
-`comp_size` (4), then `comp_size` payload bytes. The file ends with the
-stream CRC32 (4 bytes, LE) and the end magic `"SZP1"` (4 bytes).
+Magic: `'S','Z','P', (0x40 | 7)`.  Each block header is **7 bytes**:
+`type` (1), `raw_size` (LE u24), `comp_size` (LE u24), then `comp_size`
+payload bytes.  `raw_size` must be in `[1, 2^24-1]`, `comp_size >= 1` (and
+`== raw_size` for stored blocks).  Blocks continue while more than 4 bytes
+remain in the file; the last 4 bytes are the stream CRC32 (ISO-HDLC of the
+raw stream).  There is no end magic, no `total_raw` and no `block_size` —
+the reader walks blocks to EOF-minus-4.  A single-block archive therefore
+costs **15 bytes** of overhead (4 magic + 7 block header + 4 CRC), 23 bytes
+less than the legacy container.
 
 | type | codec |
 |------|-------|
 | 0    | stored (raw copy, `comp_size == raw_size`) |
 | 1    | SZLZRC payload: 1 mode byte then the RC stream (see §2) |
-| other| reserved |
+| other| rejected |
 
-Sum of block `raw_size` fields must equal the header `total_raw`.
+Block boundaries are a pure encoder choice (bounded by 16 MiB raw per block);
+the decoder is independent of them.
 
-### 1.3 Footer (8 bytes)
+### 1.2 Bare stored form (v6+)
 
-`stream_crc` (LE u32, CRC-32/ISO-HDLC of the raw stream) and `reserved`
-(LE u32, zero).
-
-### 1.4 Bare stored form (v6+)
-
-When a whole file fits in one block and no codec can shrink it, the encoder
-writes the **bare stored form** instead of the container above:
+When compression cannot save at least 12 bytes (`payload + 11 >= total_raw`),
+the encoder writes the **bare stored form** instead of the container above:
 
 ```
 magic "SZP" (3 bytes) | flags+version (1 byte) | raw bytes to EOF
@@ -69,11 +71,27 @@ no block framing, no length field and no CRC — the payload is the file,
 verbatim.  Decoders detect the form by `"SZP"` and the high bit of byte 3;
 v4/v5 decoders reject it on the magic.  Rationale: incompressible input is
 stored exactly as-is with a 4-byte frame, the smallest honest overhead in the
-field (a brotli/zstd stored stream needs 5+ bytes).
+field (a brotli/zstd stored stream needs 5+ bytes), and the whole-file
+expansion of G0D SZIP is therefore bounded at +4 bytes.
+
+### 1.3 Legacy container (v4–v6, read-only)
+
+v4–v6 archives are still decoded byte-exactly:
+
+```
+header (20 bytes) | block* | footer (8 bytes)
+```
+
+Header: magic `"SZP1"` (4), `version` (1, 4–6), flags (1, zero), reserved
+(2), `block_size` (LE u32, `1..2^24`), `total_raw` (LE u64).  Block headers
+are 10 bytes LE: `type` (1), `pad` (1, zero), `raw_size` (LE u32),
+`comp_size` (LE u32), then `comp_size` payload bytes; the sum of `raw_size`
+must equal `total_raw`.  Footer: stream CRC32 (LE u32) and the end magic
+`"SZP1"` (4 bytes).  G0D SZIP no longer writes this form.
 
 ---
 
-## 2. Block codec: SZLZRC v4 (`type = 1`)
+## 2. Block codec: SZLZRC v7 (`type = 1`)
 
 **S**uper**Z**ip **LZ**77 + **R**ange **C**oder + context mixing.
 
@@ -138,9 +156,9 @@ arithmetic, but `p` is supplied externally and is *not* updated by the coder.
 - `is_match` — literal vs match flag
 - `is_rep` — rep match vs normal match
 - `rep_sel[2]` — rep index: bit0 `0`→rep0, `1`→rep1/2; bit1 `0`→rep1, `1`→rep2
-- `len_unary[10]`, `len_bits[10]` — Elias gamma of `len - 2` (regime 0, shared)
-- regime 2 only: `nlen_unary[11]`/`nlen_bits[11]` (normal-match length) and
-  `rlen_unary[11]`/`rlen_bits[11]` (rep length) replace the shared model
+- `len_unary[22]`, `len_bits[22]` — Elias gamma of `len - 2` (regime 0, shared)
+- regime 2 only: `nlen_unary[22]`/`nlen_bits[22]` (normal-match length) and
+  `rlen_unary[22]`/`rlen_bits[22]` (rep length) replace the shared model
 - regime 2 only: `slot_cls[4][12]`/`slotb_cls[4][10]` — slot model per
   length class `min(len - 2, 3)` (replaces the shared slot model)
 - `off_mode` — offset mode flag
@@ -168,12 +186,12 @@ repeat until raw_size bytes are produced:
   1 -> is_rep?
        1 -> rep match:
             rep_sel bits select idx in {0,1,2}
-            len  = gamma(len_unary/len_bits) + 2      in [3, 2048]
+            len  = gamma(len_unary/len_bits) + 2      in [3, 2^21+2]
             offset = rep[idx]                          (must be != 0, <= out_pos)
             rep update: if idx > 0 { tmp=rep[idx]; shift; rep0=tmp }
        0 -> normal match:
             offset code (below)          [regime 0]
-            len  = gamma(len_unary/len_bits) + 2      in [3, 2048]
+            len  = gamma(len_unary/len_bits) + 2      in [3, 2^21+2]
             rep update: rep2=rep1; rep1=rep0; rep0=offset
             -- regime 2 (modes 2/3) reverses the order: len first
                (gamma(nlen_unary/nlen_bits)), then the offset code whose
@@ -198,6 +216,15 @@ repeat until raw_size bytes are produced:
   `off_direct[i]` (bit `i`, `i` from `n-2` down to `ntree`)
 
 `off` must decode to `[1, 2^20]`.
+
+**Run tokens (v8).**  Match and rep lengths are Elias-gamma coded values
+`len - 2` with up to 21 bit-planes (`SZIP_MAX_RUN = 2^21`), so a single
+token can carry an arbitrarily long run of one repeated byte (e.g. one
+distance-1 match for an entire zero page).  Such runs used to cost one
+2 KiB token per 2048 bytes; they are now a single token.  Decoders must
+accept lengths up to `2^21 + 2` and simply bound the copy by the remaining
+output (`len <= raw_size - out_pos`); the encoder clamps every emitted
+length at `2^21`.
 
 ### 2.4 Literal mixer ("GOD stage", normative)
 
@@ -355,7 +382,21 @@ streams are rejected by v4 decoders.
 BWT block codec (§2.7, min-of-4 entropy coders) and bits 3-5 select the
 byte-delta transform.  v6 encoders code all four LZ modes, the BWT codec on
 the raw block and on each of the four delta transforms, and store the
-smallest (self-tuning min-of-all).  The bare stored form (§1.4) adds a
+smallest (self-tuning min-of-all).  The bare stored form (§1.2) adds a
 4-byte frame for incompressible single-block files.  v4 and v5 streams
 (header version 4/5, delta id 0) decode byte-exactly with a v6 decoder;
 v6 streams are rejected by older decoders on the version field.
+
+`version = 7` (2026-11-17) changes the **container only**; every payload
+format above is bit-identical.  The compact v7 container (§1.1) replaces
+the 20-byte header / 10-byte block headers / end-magic layout with a 4-byte
+magic, 7-byte block headers and a 4-byte trailing CRC — 23 bytes less
+overhead per archive.  The bare rule tightens to "compression saves at
+least 12 bytes" so the worst-case expansion stays +4 bytes.  The SZLZRC
+payload itself (called "SZLZRC v7") extends match/rep lengths to
+`len - 2` gamma codes with 21 bit-planes (§2.3, run tokens), and the
+regime-2 length tables grow to 22 positions; indices 0..9 evolve exactly
+as in v4-v6, so all legacy payload bytes are reproduced identically.
+Decoders route by the 4th magic byte (§1) and accept containers v4-v7;
+v4-v6 archives decode byte-exactly.  v7 streams are rejected by older
+decoders on the version/flag bytes.

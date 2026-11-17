@@ -17,11 +17,12 @@ No third-party compression code anywhere — no zlib, zstd, lz4, brotli or any
 other library. Both engines speak `.szip`
 ([docs/SZIP_FORMAT.md](docs/SZIP_FORMAT.md)) with deterministic output, and
 the Rust `szip-sys` crate merges the C++ engine into Rust through a C ABI.
-Format status: the C++ engine implements **v6** (min-of-4 LZ parse, BWT
-blocks, byte-delta transforms, bare stored frame; v4/v5 streams decode
-byte-exactly). The pure-Rust engine currently implements the v3-era format
-and needs a format refresh to consume v6 streams — the C++ engine is the
-reference implementation.
+Format status: the C++ engine implements **v7** (compact 15-byte container,
+run tokens to 2 MiB, min-of-4 LZ parse, BWT blocks, byte-delta transforms,
+bare stored frame; v4/v5/v6 archives decode byte-exactly — verified against
+the frozen v5 encoder). The pure-Rust engine currently implements the v3-era
+format and needs a format refresh to consume v7 streams — the C++ engine is
+the reference implementation.
 
 ## Layout
 
@@ -75,7 +76,7 @@ Everything runs in-process with the same encoder/decoder; nothing leaves the
 machine. `--fast`/the GUI toggle trims the parse search further on
 pathological input; the default encoder already escalates in measured steps.
 
-## Codec: SZLZRC v6 (LZ parse + BWT escape)
+## Codec: SZLZRC v7 (LZ parse + BWT escape)
 
 **S**uper**Z**ip **LZ**77 + **R**ange **C**oder + integer context mixing —
 block-based (default 1 MiB), price-aware hash-chain matching (up to 2 KiB
@@ -90,81 +91,87 @@ entropy coders: raw columns and MTF ranks, word and gap mixer modes) and
 and the smallest ships (self-tuning min-of-all). Incompressible single-block
 files use the 4-byte **bare stored** frame, so `.szip` never expands data and
 beats every competitor's stored-stream framing (500,004 B on 500,000 B of
-random vs 500,005 for brotli).
+random vs 500,005 for brotli). v7 adds **run tokens** (a single match token
+carries a whole repeated-byte run up to 2 MiB — sparse/zero pages collapse)
+and the **compact container**: 4-byte magic + 7-byte block headers + trailing
+CRC32 = 15 bytes of framing per archive, 23 bytes less than v6.
 
 Measured on this project's benchmark corpora (ratio = compressed/raw, lower
 is better; `tests/mkcorpus.sh` / `tests/corpus20.py` regenerate them).
 zstd/brotli/lz4/snappy columns are frozen reference numbers from the v5 run
 of the same deterministic corpora; gzip/bzip2/xz re-measure each run
-(`python3 tests/benchall.py`, raw log: `docs/bench20_v7.txt`):
+(`python3 tests/benchall.py`, raw log: `docs/bench20_v8.txt`):
 
 | corpus (raw size) | **G0D SZIP v7** | gzip-9 | bzip2-9 | xz-9e | zstd-22 | brotli-11 | lz4 | snappy |
 |---|---|---|---|---|---|---|---|---|
-| code (70,592) | **17,209** | 19,282 | 18,214 | 17,640 | 18,012 | 16,894 | 23,869 | 29,674 |
-| text (500,003) | **53,023** | 86,539 | 53,954 | 76,764 | 76,343 | 78,420 | 106,834 | 150,185 |
-| rand (500,000) | **500,004** | 500,107 | 502,659 | 500,084 | 500,021 | 500,005 | 500,051 | 500,074 |
-| src (277,530) | **52,155** | 76,747 | 65,288 | 51,796 | 56,066 | 50,871 | 98,238 | 119,236 |
-| b64 (131,072) | **24,430** | 36,886 | 25,452 | 32,988 | 33,120 | 33,007 | 41,663 | 62,974 |
-| binary (131,072) | **64,289** | 69,440 | 67,809 | 65,172 | 67,291 | 63,470 | 79,812 | 93,102 |
-| csv (131,072) | **32,624** | 47,704 | 34,309 | 41,676 | 45,164 | 41,001 | 58,390 | 79,770 |
-| dict (131,072) | **34,461** | 53,651 | 41,951 | 36,660 | 33,750 | 28,837 | 67,227 | 90,899 |
-| dna (131,072) | **19,028** | 23,602 | 20,218 | 21,732 | 21,436 | 21,048 | 29,620 | 51,276 |
-| floats (131,072) | **92,818** | 99,781 | 100,734 | 84,992 | 97,335 | 92,123 | 107,673 | 131,098 |
-| hex (131,072) | **34,266** | 47,547 | 37,114 | 41,564 | 44,763 | 41,051 | 56,535 | 74,350 |
-| html (131,072) | **12,038** | 16,919 | 12,036 | 15,252 | 15,680 | 14,857 | 19,534 | 30,747 |
-| json (131,072) | **10,775** | 16,313 | 11,133 | 13,156 | 13,614 | 12,867 | 22,017 | 32,431 |
-| log (131,072) | **8,940** | 13,495 | 8,948 | 11,172 | 11,589 | 11,166 | 17,404 | 26,010 |
-| mixed (131,072) | **52,090** | 61,722 | 56,973 | 53,240 | 56,979 | 53,451 | 72,357 | 85,583 |
-| pcm (131,072) | **101,896** | 127,322 | 122,971 | 124,512 | 127,575 | 114,926 | 131,099 | 131,098 |
-| prose (131,072) | **26,431** | 36,679 | 28,427 | 33,292 | 33,285 | 32,793 | 42,781 | 61,607 |
-| sparse (131,072) | **880** | 1,034 | 1,020 | 912 | 820 | 786 | 1,331 | 6,921 |
-| utf8 (131,072) | **14,786** | 23,091 | 14,981 | 21,212 | 20,989 | 20,973 | 28,341 | 41,912 |
-| xml (131,072) | **13,937** | 20,903 | 13,835 | 17,768 | 18,924 | 17,142 | 25,667 | 34,636 |
+| code (70,592) | **17,186** | 19,282 | 18,214 | 17,640 | 18,012 | 16,894 | 23,869 | 29,674 |
+| text (500,003) | **53,000** | 86,539 | 53,954 | 76,764 | 76,343 | 78,420 | 106,834 | 150,185 |
+| rand (500,000) | **500,004** | 500,107 | 502,760 | 500,084 | 500,021 | 500,005 | 500,051 | 500,074 |
+| src (277,530) | **52,132** | 76,747 | 65,288 | 51,796 | 56,066 | 50,871 | 98,238 | 119,236 |
+| b64 (131,072) | **24,407** | 36,886 | 25,452 | 32,988 | 33,120 | 33,007 | 41,663 | 62,974 |
+| binary (131,072) | **64,266** | 69,440 | 67,809 | 65,172 | 67,291 | 63,470 | 79,812 | 93,102 |
+| csv (131,072) | **32,601** | 47,704 | 34,309 | 41,676 | 45,164 | 41,001 | 58,390 | 79,770 |
+| dict (131,072) | **34,438** | 53,651 | 41,951 | 36,660 | 33,750 | 28,837 | 67,227 | 90,899 |
+| dna (131,072) | **19,005** | 23,602 | 20,218 | 21,732 | 21,436 | 21,048 | 29,620 | 51,276 |
+| floats (131,072) | **92,795** | 99,781 | 100,734 | 84,992 | 97,335 | 92,123 | 107,673 | 131,098 |
+| hex (131,072) | **34,243** | 47,547 | 37,114 | 41,564 | 44,763 | 41,051 | 56,535 | 74,350 |
+| html (131,072) | **12,015** | 16,919 | 12,036 | 15,252 | 15,680 | 14,857 | 19,534 | 30,747 |
+| json (131,072) | **10,752** | 16,313 | 11,133 | 13,156 | 13,614 | 12,867 | 22,017 | 32,431 |
+| log (131,072) | **8,917** | 13,495 | 8,948 | 11,172 | 11,589 | 11,166 | 17,404 | 26,010 |
+| mixed (131,072) | **52,067** | 61,722 | 56,973 | 53,240 | 56,979 | 53,451 | 72,357 | 85,583 |
+| pcm (131,072) | **101,873** | 127,322 | 122,971 | 124,512 | 127,575 | 114,926 | 131,099 | 131,098 |
+| prose (131,072) | **26,408** | 36,679 | 28,427 | 33,292 | 33,285 | 32,793 | 42,781 | 61,607 |
+| sparse (131,072) | **780** | 1,034 | 1,020 | 912 | 820 | 786 | 1,331 | 6,921 |
+| utf8 (131,072) | **14,763** | 23,091 | 14,981 | 21,212 | 20,989 | 20,973 | 28,341 | 41,912 |
+| xml (131,072) | **13,914** | 20,903 | 13,835 | 17,768 | 18,924 | 17,142 | 25,667 | 34,636 |
 
 Win/loss against the best alternative on each corpus (the written check is
 `sh tests/benchall.sh` / `python3 tests/benchall.py`, every roundtrip
-byte-exact):
+byte-exact; zstd/brotli/lz4/snappy columns frozen from the v5 run of the
+same deterministic corpora, gzip/bzip2/xz re-measured):
 
-**12 wins** — text +1.73%, pcm +11.34%, hex +7.67%, prose +7.02%, dna
-+5.89%, csv +4.91%, b64 +4.02%, json +3.22%, mixed +2.16%, utf8 +1.30%,
-log +0.09% (8 bytes), rand +1 byte (bare framing beats brotli's).
-**8 losses** — floats −9.21% (xz), sparse −11.96% and dict −19.50%
-(brotli's run/static-model niches), xml −0.74%, code −1.86%, src −2.52%,
-binary −1.29% (brotli), html −0.02% — 2 bytes behind bzip2 (12,038 vs
-12,036).
+**14 wins** — pcm +11.36%, hex +7.74%, prose +7.10%, dna +6.00%, csv
++4.98%, b64 +4.11%, json +3.42%, mixed +2.20%, text +1.77%, utf8 +1.46%,
+**html +0.17%** (12,015 vs bzip2's 12,036), **sparse +0.76%** (780 vs
+brotli's 786), log +0.35%, rand +1 byte (bare framing beats brotli's).
+**6 losses** — dict −19.42% (brotli's static-model niche), floats −9.18%
+(xz's filters), src −2.48%, code −1.73%, binary −1.25% (brotli), xml
+−0.57% (bzip2, 79 bytes).
 
 | won | lost (to) |
 |---|---|
-| text **+1.73%**, pcm **+11.34%**, hex **+7.67%**, prose **+7.02%** | floats −9.21% (xz), sparse −11.96%, dict −19.50% (brotli run/static models) |
-| dna **+5.89%**, csv **+4.91%**, b64 **+4.02%**, json **+3.22%** | xml −0.74% (bzip2), code −1.86%, src −2.52%, binary −1.29% (brotli) |
-| mixed **+2.16%**, utf8 **+1.30%**, log **+0.09%**, rand **+1 byte** | html **−0.02%** — 2 bytes behind bzip2 (12,038 vs 12,036) |
+| pcm **+11.36%**, hex **+7.74%**, prose **+7.10%**, dna **+6.00%** | dict −19.42% (brotli static models), floats −9.18% (xz filters) |
+| csv **+4.98%**, b64 **+4.11%**, json **+3.42%**, mixed **+2.20%** | src −2.48%, code −1.73%, binary −1.25% (brotli) |
+| text **+1.77%**, utf8 **+1.46%**, sparse **+0.76%**, html **+0.17%** | xml −0.57% — 79 bytes behind bzip2 (13,914 vs 13,835) |
+| log **+0.35%**, rand **+1 byte** | |
 
-How v7 flips the board (v5 scoreboard was 4 wins / 15 losses / 1 DNF): a
+How v7 keeps climbing (v5 scoreboard was 4 wins / 15 losses / 1 DNF): a
 Burrows-Wheeler escape hatch (own cyclic-doubling rotation sort, min-of-4
 entropy coders, MTF/gap literal modes) and byte-delta transforms
 (d = 1/2/4/8) compete per block against the LZ parse and the smallest ships
 — the html/log/json/dna/csv/b64/hex/pcm class that bzip2 used to own is now
-G0D's. Incompressible input stays bare (4-byte container + raw), so random
-data beats even brotli's stored framing by one byte and `.szip` never
-expands data.
+G0D's. v8 engine adds **run tokens** (sparse 880 → 780: whole zero pages in
+one token) and the **compact v7 container** (15-byte framing, −23 bytes on
+every compressed archive — html and sparse flipped to wins). Incompressible
+input stays bare (4-byte container + raw), so random data beats even
+brotli's stored framing by one byte and `.szip` never expands data.
 
 **Speed (the v7 rewrite)**: one refined parse emits all four modes (the
 modes differ only in pricing), trial lengths are bounded and long matches
 are taken whole, prices are lazily cached per position, the BWT family
 runs 5-way parallel with a gap-entropy prefilter, and the finder chain is
-capped. Result: **2.6-5.3 s to encode a 128 KiB corpus, 12.2 s for the
-500 KB text corpus, 10.4 s worst-case (sparse — 39x faster than the v6
-build's 402 s)**; `--fast`/GUI toggle halves that again (6.9 s on 500 KB
-text, same size there). Decode is single-pass: 0.2-0.3 s. gzip/xz remain
-faster encoders at far worse ratios; G0D SZIP trades encode search for
-wins on 12 of 20 types.
+capped. Result: **2.4-5.9 s to encode a 128 KiB corpus, 12.6 s for the
+500 KB text corpus** (5.8 s worst-case on the 278 KB src tree); `--fast`/
+GUI toggle halves that again (7.8 s on 500 KB text, same size there).
+Decode is single-pass: 0.2-0.4 s. gzip/xz remain faster encoders at far
+worse ratios; G0D SZIP trades encode search for wins on 14 of 20 types.
 
-What remains: **floats** (xz's filters own structured high-entropy binary;
-the ARF float coder is not yet in the v6 block format), brotli's
-run/static-model niches (**sparse, dict**), **html is 2 bytes** behind
-bzip2, and the four sub-3% rows (xml, code, src, binary).
+What remains: **dict** (brotli's static-model niche, −19%), **floats**
+(xz's filters own structured high-entropy binary; the ARF float coder is
+not yet in the block format), and the four sub-3% rows (src, code, binary
+vs brotli; xml 79 bytes behind bzip2).
 `tests/beatsniper.sh` is the strict classic gate: 10 passed / 1 failed
-(the 4%-under-xz stretch on code: 17,209 vs 16,933).
+(the 4%-under-xz stretch on code: 17,186 vs 16,933).
 
 ## Safety
 

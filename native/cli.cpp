@@ -64,12 +64,16 @@ int cmd_info(const char *path) {
   bool bare = false;
   unsigned char m4[4] = {0, 0, 0, 0};
   std::fseek(f, 0, SEEK_SET);
-  if (std::fread(m4, 1, 4, f) == 4 && (m4[3] & SZIP_BARE_FLAG)) {
-    bare = true;
-    ver = m4[3] & ~SZIP_BARE_FLAG;
-  } else {
-    std::fseek(f, 4, SEEK_SET);
-    if (std::fread(&ver, 1, 1, f) != 1) ver = SZIP_VERSION;
+  if (std::fread(m4, 1, 4, f) == 4) {
+    if (m4[3] & SZIP_BARE_FLAG) {
+      bare = true;
+      ver = m4[3] & ~SZIP_BARE_FLAG;
+    } else if (m4[3] & SZIP_COMPACT_FLAG) {
+      ver = m4[3] & 0x3F;
+    } else {
+      std::fseek(f, 4, SEEK_SET);
+      if (std::fread(&ver, 1, 1, f) != 1) ver = SZIP_VERSION;
+    }
   }
   std::fclose(f);
   std::printf("file       : %s\n", path);
@@ -78,7 +82,7 @@ int cmd_info(const char *path) {
     std::printf("codec      : stored (incompressible input, verbatim)\n");
   } else {
     std::printf("format     : .szip v%d\n", ver);
-    std::printf("codec      : SZLZRC v5 (min-of-4 parse modes) + BWT blocks\n");
+    std::printf("codec      : SZLZRC v7 (min-of-4 modes + BWT escape)\n");
   }
   std::printf("raw size   : %llu bytes\n", (unsigned long long)raw);
   std::printf("archive    : %ld bytes\n", comp);

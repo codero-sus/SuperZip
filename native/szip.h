@@ -22,12 +22,14 @@ extern "C" {
 #define SZIP_ERR_BUFFER (-7)
 
 /* Container constants. */
-#define SZIP_VERSION 6
+#define SZIP_VERSION 7
 #define SZIP_MAGIC0 0x53 /* 'S' */
 #define SZIP_MAGIC1 0x5A /* 'Z' */
 #define SZIP_MAGIC2 0x50 /* 'P' */
 #define SZIP_MAGIC3 0x31 /* '1' */
 #define SZIP_BARE_FLAG 0x80 /* magic[3] high bit: bare stored form (v6+) */
+#define SZIP_COMPACT_FLAG 0x40 /* magic[3] bit 6: compact v7 container */
+#define SZIP_V7_BLOCK_HEADER_SIZE 7 /* type u8 + raw u24 + comp u24 */
 #define SZIP_HEADER_SIZE 20
 #define SZIP_FOOTER_SIZE 8
 #define SZIP_BLOCK_HEADER_SIZE 10
@@ -38,6 +40,9 @@ extern "C" {
 /* Codec limits (SZLZRC v1). */
 #define SZIP_MIN_MATCH 3
 #define SZIP_MAX_MATCH 2048
+// Run-token ceiling: a dist-1 match (always a pure one-byte run) may span the
+// whole block; the Elias-gamma length field covers up to 2^21.
+#define SZIP_MAX_RUN (1u << 21)
 #define SZIP_MAX_OFFSET (1u << 20)
 
 /* Upper bound for the compressed size of `raw_len` bytes. */

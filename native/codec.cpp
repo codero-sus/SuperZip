@@ -47,8 +47,8 @@ struct Model {
   Prob is_match = kProbInit;
   Prob is_rep = kProbInit;
   Prob rep_sel[2] = {kProbInit, kProbInit}; // 0: rep0|rep12, 1: rep1|rep2
-  Prob len_unary[10];             // gamma of (len - 2) (regime 0 shared)
-  Prob len_bits[10];
+  Prob len_unary[22];             // gamma of (len - 2) (regime 0 shared)
+  Prob len_bits[22];
   Prob off_mode = kProbInit;      // 0: tiny (off 1-4), 1: slot+direct
   Prob tiny_unary[8];             // gamma of (off), x in [1, 4]
   Prob tiny_bits[8];
@@ -59,10 +59,10 @@ struct Model {
 
   // -- regime-2 extras (appended: v4 field layout above is frozen so old
   //    files decode with byte-identical probability evolution) --
-  Prob nlen_unary[11];            // normal-match length (idx 0..10 used)
-  Prob nlen_bits[11];
-  Prob rlen_unary[11];            // rep length
-  Prob rlen_bits[11];
+  Prob nlen_unary[22];            // normal-match length
+  Prob nlen_bits[22];
+  Prob rlen_unary[22];            // rep length
+  Prob rlen_bits[22];
   Prob slot_cls[4][12];           // slot model per length class
   Prob slotb_cls[4][10];
 
@@ -464,10 +464,14 @@ static void collect_lens(uint32_t max_len, uint32_t rank,
 struct CandCache {
   std::vector<uint8_t> cnt;
   std::vector<Match> m; // SZ_CANDW per position
+  std::vector<uint32_t> re; // one-past-end of the maximal equal-byte run
 };
 static void build_cand_cache(const uint8_t *src, uint32_t n, CandCache &cc) {
   cc.cnt.assign(n, 0);
   cc.m.assign((size_t)n * SZ_CANDW, Match{0, 0});
+  cc.re.assign(n, 0);
+  for (uint32_t i = n; i-- > 0;)
+    cc.re[i] = (i + 1 < n && src[i] == src[i + 1]) ? cc.re[i + 1] : i + 1;
   MatchFinder mf;
   mf.prepare(n);
   for (uint32_t pos = 0; pos < n; ++pos) {
@@ -636,6 +640,7 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
     uint32_t offp[16][4]; // regime 2: offset price per length class
     ++lenst_cur;
     auto plen = [&](uint32_t l, bool is_rep) -> uint32_t {
+      if (l > kMaxMatch) return price_len(ms, is_rep, l);
       if (lenst[l] != lenst_cur) {
         lenst[l] = lenst_cur;
         if (ms.regime) {
@@ -679,11 +684,18 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
       if (!SZ_DP_NO_REP) {
         const RepPick rep = rep_match(src, n, pos, A.reps);
         if (rep.len >= kMinMatch) {
+          // a dist-1 rep inside a run extends past the finder cap (run token)
+          uint32_t run_ext =
+              (pos > 0 && A.reps[rep.idx] == 1 && src[pos] == src[pos - 1])
+                  ? cc.re[pos] - pos
+                  : 0;
+          if (run_ext > SZIP_MAX_RUN) run_ext = SZIP_MAX_RUN;
+          const uint32_t rep_max = run_ext > rep.len ? run_ext : rep.len;
           const uint32_t rep_prefix =
               price_bit(ms.is_match, 1) + price_bit(ms.is_rep, 1) +
               price_bit(ms.rep_sel[0], rep.idx == 0 ? 0u : 1u) +
               (rep.idx != 0 ? price_bit(ms.rep_sel[1], rep.idx == 1 ? 0u : 1u) : 0u);
-          collect_lens(rep.len, 0, lens);
+          collect_lens(rep_max, 0, lens);
           DPNode nd = A;
           nd.prev = idx;
           nd.off = 0;
@@ -694,6 +706,25 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
             nd.len = l;
             try_insert(pos + l, nd);
           }
+        }
+      }
+
+      // run edge: dist-1 whole-run match past the 2 KiB finder cap.  A
+      // dist-1 match is by definition a run of one byte, so one token can
+      // carry the entire run (the format's gamma length covers up to 2^21).
+      if (pos > 0 && src[pos] == src[pos - 1]) {
+        uint32_t run_len = cc.re[pos] - pos;
+        if (run_len > SZIP_MAX_RUN) run_len = SZIP_MAX_RUN;
+        if (run_len > kMaxMatch) {
+          DPNode nd = A;
+          nd.prev = idx;
+          nd.off = 1;
+          nd.rep_idx = UINT32_MAX;
+          reps_after_normal(nd.reps, 1);
+          nd.cost = A.cost + price_bit(ms.is_match, 1) + price_bit(ms.is_rep, 0) +
+                    price_offset_p(ms, 1, 2) + plen(run_len, false);
+          nd.len = run_len;
+          try_insert(pos + run_len, nd);
         }
       }
 
@@ -1076,12 +1107,12 @@ int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
 
       uint32_t xlen = 0;
       int e = m.regime
-                  ? decode_gamma(rc, m.rlen_unary, m.rlen_bits, 10, &xlen)
-                  : decode_gamma(rc, m.len_unary, m.len_bits, 10, &xlen);
+                  ? decode_gamma(rc, m.rlen_unary, m.rlen_bits, 21, &xlen)
+                  : decode_gamma(rc, m.len_unary, m.len_bits, 21, &xlen);
       if (e != SZIP_OK) return e;
       if (!rc.ok()) return SZIP_ERR_TRUNCATED;
       const uint32_t len = xlen + 2;
-      if (len < kMinMatch || len > kMaxMatch) return SZIP_ERR_CORRUPT;
+      if (len < kMinMatch || len > SZIP_MAX_RUN) return SZIP_ERR_CORRUPT;
       const uint32_t off = reps[idx];
       if (off == 0 || off > out_pos) return SZIP_ERR_CORRUPT;
       if (len > n - out_pos) return SZIP_ERR_CORRUPT;
@@ -1101,22 +1132,22 @@ int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
       int e;
       if (m.regime) {
         // tight regime: length first, then class-aware offset
-        e = decode_gamma(rc, m.nlen_unary, m.nlen_bits, 10, &xlen);
+        e = decode_gamma(rc, m.nlen_unary, m.nlen_bits, 21, &xlen);
         if (e != SZIP_OK) return e;
         if (!rc.ok()) return SZIP_ERR_TRUNCATED;
         const uint32_t len = xlen + 2;
-        if (len < kMinMatch || len > kMaxMatch) return SZIP_ERR_CORRUPT;
+        if (len < kMinMatch || len > SZIP_MAX_RUN) return SZIP_ERR_CORRUPT;
         e = decode_offset(rc, m, len, &off);
         if (e != SZIP_OK) return e;
       } else {
         e = decode_offset(rc, m, 2, &off);
         if (e != SZIP_OK) return e;
-        e = decode_gamma(rc, m.len_unary, m.len_bits, 10, &xlen);
+        e = decode_gamma(rc, m.len_unary, m.len_bits, 21, &xlen);
         if (e != SZIP_OK) return e;
       }
       if (!rc.ok()) return SZIP_ERR_TRUNCATED;
       const uint32_t len = xlen + 2;
-      if (len < kMinMatch || len > kMaxMatch) return SZIP_ERR_CORRUPT;
+      if (len < kMinMatch || len > SZIP_MAX_RUN) return SZIP_ERR_CORRUPT;
       if (off == 0 || off > out_pos) return SZIP_ERR_CORRUPT;
       if (len > n - out_pos) return SZIP_ERR_CORRUPT;
 
@@ -1141,19 +1172,11 @@ int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
 
 // ------------------------------------------------------------- le helpers --
 
-void put_u16(std::ostream &os, uint16_t v) {
-  char b[2] = {static_cast<char>(v & 0xFF), static_cast<char>((v >> 8) & 0xFF)};
-  os.write(b, 2);
-}
 void put_u32(std::ostream &os, uint32_t v) {
   char b[4] = {static_cast<char>(v & 0xFF), static_cast<char>((v >> 8) & 0xFF),
                static_cast<char>((v >> 16) & 0xFF),
                static_cast<char>((v >> 24) & 0xFF)};
   os.write(b, 4);
-}
-void put_u64(std::ostream &os, uint64_t v) {
-  put_u32(os, static_cast<uint32_t>(v & 0xFFFFFFFFu));
-  put_u32(os, static_cast<uint32_t>(v >> 32));
 }
 bool get_u16(std::istream &is, uint16_t *v) {
   unsigned char b[2];
@@ -1176,16 +1199,26 @@ bool get_u64(std::istream &is, uint64_t *v) {
   return true;
 }
 
-bool write_header(std::ostream &os, uint32_t block_size, uint64_t total_raw) {
-  char magic[4] = {SZIP_MAGIC0, SZIP_MAGIC1, SZIP_MAGIC2, SZIP_MAGIC3};
-  os.write(magic, 4);
-  char ver = SZIP_VERSION, flags = 0;
-  os.write(&ver, 1);
-  os.write(&flags, 1);
-  put_u16(os, 0);
-  put_u32(os, block_size);
-  put_u64(os, total_raw);
-  return static_cast<bool>(os);
+// v7 compact container: 4-byte magic ('SZP', 0x40|ver), then blocks of
+// [type u8][raw u24][comp u24] + payload, then a 4-byte CRC32 at EOF.  The
+// legacy v4-v6 container (20-byte header, 10-byte block headers, trailing
+// end magic) is still read; new archives are always v7.
+inline void write_compact_magic(std::ostream &os) {
+  char hdr[4] = {(char)SZIP_MAGIC0, (char)SZIP_MAGIC1, (char)SZIP_MAGIC2,
+                 (char)(SZIP_COMPACT_FLAG | SZIP_VERSION)};
+  os.write(hdr, 4);
+}
+inline void write_compact_block(std::ostream &os, uint8_t type,
+                                uint32_t raw_size, uint32_t comp_size) {
+  char bh[SZIP_V7_BLOCK_HEADER_SIZE];
+  bh[0] = (char)type;
+  bh[1] = (char)(raw_size & 0xFF);
+  bh[2] = (char)((raw_size >> 8) & 0xFF);
+  bh[3] = (char)((raw_size >> 16) & 0xFF);
+  bh[4] = (char)(comp_size & 0xFF);
+  bh[5] = (char)((comp_size >> 8) & 0xFF);
+  bh[6] = (char)((comp_size >> 16) & 0xFF);
+  os.write(bh, SZIP_V7_BLOCK_HEADER_SIZE);
 }
 
 // Bare stored form (v6+): 'S','Z','P',(0x80|ver) + raw bytes to EOF.
@@ -1197,6 +1230,10 @@ inline bool is_bare_magic(const unsigned char m[4]) {
 }
 inline int bare_version(const unsigned char m[4]) {
   return m[3] & ~SZIP_BARE_FLAG;
+}
+inline bool is_compact_magic(const unsigned char m[4]) {
+  return m[0] == SZIP_MAGIC0 && m[1] == SZIP_MAGIC1 && m[2] == SZIP_MAGIC2 &&
+         (m[3] & SZIP_COMPACT_FLAG) != 0 && (m[3] & SZIP_BARE_FLAG) == 0;
 }
 
 int read_and_check_header(std::istream &is, uint32_t *block_size,
@@ -1263,7 +1300,9 @@ int compress_file(const std::string &in_path, const std::string &out_path,
       return SZIP_ERR_IO;
     std::vector<uint8_t> payload;
     encode_block_szlzrc(raw.data(), static_cast<uint32_t>(total), payload);
-    if (payload.size() >= (size_t)total) {
+    // Bare frame wins unless compression saves at least the 15-byte compact
+    // overhead (bare file = raw + 4).
+    if (payload.size() + 11 >= (size_t)total) {
       char hdr[4] = {(char)SZIP_MAGIC0, (char)SZIP_MAGIC1, (char)SZIP_MAGIC2,
                      (char)(SZIP_BARE_FLAG | SZIP_VERSION)};
       os.write(hdr, 4);
@@ -1272,28 +1311,17 @@ int compress_file(const std::string &in_path, const std::string &out_path,
                  (std::streamsize)total);
       return os ? SZIP_OK : SZIP_ERR_IO;
     }
-    if (!write_header(os, block_size, total)) return SZIP_ERR_IO;
-    char hdr[SZIP_BLOCK_HEADER_SIZE];
-    hdr[0] = SZIP_BLOCK_SZLZRC;
-    hdr[1] = 0;
-    hdr[2] = static_cast<char>(total & 0xFF);
-    hdr[3] = static_cast<char>((total >> 8) & 0xFF);
-    hdr[4] = static_cast<char>((total >> 16) & 0xFF);
-    hdr[5] = static_cast<char>((total >> 24) & 0xFF);
-    const uint32_t comp_size = static_cast<uint32_t>(payload.size());
-    hdr[6] = static_cast<char>(comp_size & 0xFF);
-    hdr[7] = static_cast<char>((comp_size >> 8) & 0xFF);
-    hdr[8] = static_cast<char>((comp_size >> 16) & 0xFF);
-    hdr[9] = static_cast<char>((comp_size >> 24) & 0xFF);
-    os.write(hdr, SZIP_BLOCK_HEADER_SIZE);
-    os.write(reinterpret_cast<const char *>(payload.data()), comp_size);
+    write_compact_magic(os);
+    write_compact_block(os, SZIP_BLOCK_SZLZRC,
+                        static_cast<uint32_t>(total),
+                        static_cast<uint32_t>(payload.size()));
+    os.write(reinterpret_cast<const char *>(payload.data()),
+             (std::streamsize)payload.size());
     put_u32(os, szip_crc32(raw.data(), (size_t)total));
-    char magic[4] = {SZIP_MAGIC0, SZIP_MAGIC1, SZIP_MAGIC2, SZIP_MAGIC3};
-    os.write(magic, 4);
     return os ? SZIP_OK : SZIP_ERR_IO;
   }
 
-  if (!write_header(os, block_size, total)) return SZIP_ERR_IO;
+  write_compact_magic(os);
 
   std::vector<uint8_t> block(block_size);
   std::vector<uint8_t> payload;
@@ -1312,19 +1340,8 @@ int compress_file(const std::string &in_path, const std::string &out_path,
     const uint32_t comp_size =
         store ? want : static_cast<uint32_t>(payload.size());
 
-    // Block header, explicitly little-endian.
-    char hdr[SZIP_BLOCK_HEADER_SIZE];
-    hdr[0] = store ? SZIP_BLOCK_STORED : SZIP_BLOCK_SZLZRC;
-    hdr[1] = 0;
-    hdr[2] = static_cast<char>(want & 0xFF);
-    hdr[3] = static_cast<char>((want >> 8) & 0xFF);
-    hdr[4] = static_cast<char>((want >> 16) & 0xFF);
-    hdr[5] = static_cast<char>((want >> 24) & 0xFF);
-    hdr[6] = static_cast<char>(comp_size & 0xFF);
-    hdr[7] = static_cast<char>((comp_size >> 8) & 0xFF);
-    hdr[8] = static_cast<char>((comp_size >> 16) & 0xFF);
-    hdr[9] = static_cast<char>((comp_size >> 24) & 0xFF);
-    os.write(hdr, SZIP_BLOCK_HEADER_SIZE);
+    write_compact_block(os, store ? SZIP_BLOCK_STORED : SZIP_BLOCK_SZLZRC,
+                        want, comp_size);
 
     if (store)
       os.write(reinterpret_cast<const char *>(block.data()), want);
@@ -1336,8 +1353,6 @@ int compress_file(const std::string &in_path, const std::string &out_path,
   }
 
   put_u32(os, crc);
-  char magic[4] = {SZIP_MAGIC0, SZIP_MAGIC1, SZIP_MAGIC2, SZIP_MAGIC3};
-  os.write(magic, 4);
   return os ? SZIP_OK : SZIP_ERR_IO;
 }
 
@@ -1350,7 +1365,7 @@ int compress_buffer(const uint8_t *data, size_t len,
   // Single-block bare/normal fast path (mirrors compress_file).
   if (len <= block_size) {
     encode_block_szlzrc(data, static_cast<uint32_t>(len), payload);
-    if (payload.size() >= len) {
+    if (payload.size() + 11 >= len) {
       out.resize(4 + len);
       out[0] = SZIP_MAGIC0; out[1] = SZIP_MAGIC1; out[2] = SZIP_MAGIC2;
       out[3] = (uint8_t)(SZIP_BARE_FLAG | SZIP_VERSION);
@@ -1358,26 +1373,17 @@ int compress_buffer(const uint8_t *data, size_t len,
       return SZIP_OK;
     }
     std::ostringstream os(std::ios::binary);
-    if (!write_header(os, block_size, len)) return SZIP_ERR_IO;
-    char hdr[SZIP_BLOCK_HEADER_SIZE];
-    hdr[0] = SZIP_BLOCK_SZLZRC; hdr[1] = 0;
-    hdr[2] = (char)(len & 0xFF);        hdr[3] = (char)((len >> 8) & 0xFF);
-    hdr[4] = (char)((len >> 16) & 0xFF); hdr[5] = (char)((len >> 24) & 0xFF);
-    const uint32_t comp_size = (uint32_t)payload.size();
-    hdr[6] = (char)(comp_size & 0xFF);   hdr[7] = (char)((comp_size >> 8) & 0xFF);
-    hdr[8] = (char)((comp_size >> 16) & 0xFF);
-    hdr[9] = (char)((comp_size >> 24) & 0xFF);
-    os.write(hdr, SZIP_BLOCK_HEADER_SIZE);
-    os.write((const char *)payload.data(), comp_size);
+    write_compact_magic(os);
+    write_compact_block(os, SZIP_BLOCK_SZLZRC, (uint32_t)len,
+                        (uint32_t)payload.size());
+    os.write((const char *)payload.data(), (std::streamsize)payload.size());
     put_u32(os, szip_crc32(data, len));
-    char magic[4] = {SZIP_MAGIC0, SZIP_MAGIC1, SZIP_MAGIC2, SZIP_MAGIC3};
-    os.write(magic, 4);
     const std::string &tmp = os.str();
     out.assign(tmp.begin(), tmp.end());
     return SZIP_OK;
   }
   std::ostringstream os(std::ios::binary);
-  if (!write_header(os, block_size, len)) return SZIP_ERR_IO;
+  write_compact_magic(os);
   uint32_t crc = 0;
   size_t off = 0;
   while (off < len) {
@@ -1388,24 +1394,72 @@ int compress_buffer(const uint8_t *data, size_t len,
     encode_block_szlzrc(blk, want, payload);
     const bool store = payload.size() >= want;
     const uint32_t comp_size = store ? want : (uint32_t)payload.size();
-    char hdr[SZIP_BLOCK_HEADER_SIZE];
-    hdr[0] = store ? SZIP_BLOCK_STORED : SZIP_BLOCK_SZLZRC;
-    hdr[1] = 0;
-    hdr[2] = (char)(want & 0xFF);        hdr[3] = (char)((want >> 8) & 0xFF);
-    hdr[4] = (char)((want >> 16) & 0xFF); hdr[5] = (char)((want >> 24) & 0xFF);
-    hdr[6] = (char)(comp_size & 0xFF);   hdr[7] = (char)((comp_size >> 8) & 0xFF);
-    hdr[8] = (char)((comp_size >> 16) & 0xFF);
-    hdr[9] = (char)((comp_size >> 24) & 0xFF);
-    os.write(hdr, SZIP_BLOCK_HEADER_SIZE);
+    write_compact_block(os, store ? SZIP_BLOCK_STORED : SZIP_BLOCK_SZLZRC,
+                        want, comp_size);
     if (store) os.write((const char *)blk, want);
     else os.write((const char *)payload.data(), comp_size);
     off += want;
   }
   put_u32(os, crc);
-  char magic[4] = {SZIP_MAGIC0, SZIP_MAGIC1, SZIP_MAGIC2, SZIP_MAGIC3};
-  os.write(magic, 4);
   const std::string &tmp = os.str(); // ostringstream::str() returns a copy
   out.assign(tmp.begin(), tmp.end());
+  return SZIP_OK;
+}
+
+// Walk a compact-v7 block stream (caller has consumed the 4-byte magic; pos
+// accounting starts at 4).  Blocks: [type u8][raw u24][comp u24] + payload,
+// until exactly the trailing 4-byte CRC32 remains.  sink_vec / sink_os
+// receive decoded bytes; both null = validate only.  Hostile-input safe.
+int walk_blocks_v7(std::istream &is, uint64_t stream_len,
+                   std::vector<uint8_t> *sink_vec, std::ostream *sink_os,
+                   uint32_t *crc_out, uint64_t *produced_out) {
+  std::vector<uint8_t> payload, raw;
+  uint32_t crc = 0;
+  uint64_t produced = 0;
+  uint64_t pos = 4;
+  while (pos + 4 < stream_len) {
+    unsigned char bh[SZIP_V7_BLOCK_HEADER_SIZE];
+    if (!is.read(reinterpret_cast<char *>(bh), SZIP_V7_BLOCK_HEADER_SIZE))
+      return SZIP_ERR_TRUNCATED;
+    pos += SZIP_V7_BLOCK_HEADER_SIZE;
+    const uint8_t type = bh[0];
+    const uint32_t raw_size = (uint32_t)bh[1] | ((uint32_t)bh[2] << 8) |
+                              ((uint32_t)bh[3] << 16);
+    const uint32_t comp_size = (uint32_t)bh[4] | ((uint32_t)bh[5] << 8) |
+                               ((uint32_t)bh[6] << 16);
+    if (raw_size == 0 || comp_size == 0) return SZIP_ERR_CORRUPT;
+    if (pos + (uint64_t)comp_size + 4 > stream_len) return SZIP_ERR_CORRUPT;
+    if (type == SZIP_BLOCK_STORED) {
+      if (comp_size != raw_size) return SZIP_ERR_CORRUPT;
+      raw.resize(raw_size);
+      if (!is.read(reinterpret_cast<char *>(raw.data()), raw_size))
+        return SZIP_ERR_TRUNCATED;
+    } else if (type == SZIP_BLOCK_SZLZRC) {
+      if (comp_size < 5) return SZIP_ERR_CORRUPT;
+      payload.resize(comp_size);
+      if (!is.read(reinterpret_cast<char *>(payload.data()), comp_size))
+        return SZIP_ERR_TRUNCATED;
+      raw.resize(raw_size);
+      const int e =
+          decode_block_szlzrc(payload.data(), comp_size, raw.data(), raw_size);
+      if (e != SZIP_OK) return e;
+    } else {
+      return SZIP_ERR_UNSUPPORTED;
+    }
+    pos += comp_size;
+    crc = szip_crc32_update(crc, raw.data(), raw_size);
+    if (sink_vec) sink_vec->insert(sink_vec->end(), raw.begin(), raw.end());
+    if (sink_os &&
+        !sink_os->write(reinterpret_cast<const char *>(raw.data()), raw_size))
+      return SZIP_ERR_IO;
+    produced += raw_size;
+  }
+  if (pos + 4 != stream_len) return SZIP_ERR_CORRUPT;
+  uint32_t stored_crc = 0;
+  if (!get_u32(is, &stored_crc)) return SZIP_ERR_TRUNCATED;
+  if (stored_crc != crc) return SZIP_ERR_CORRUPT;
+  if (crc_out) *crc_out = crc;
+  if (produced_out) *produced_out = produced;
   return SZIP_OK;
 }
 
@@ -1420,6 +1474,11 @@ int decompress_buffer(const uint8_t *data, size_t len,
     return SZIP_OK;
   }
   std::istringstream is(std::string((const char *)data, len), std::ios::binary);
+  if (is_compact_magic(m)) {
+    if ((m[3] & 0x3F) > SZIP_VERSION) return SZIP_ERR_UNSUPPORTED;
+    is.seekg(4);
+    return walk_blocks_v7(is, len, &out, nullptr, nullptr, nullptr);
+  }
   uint32_t block_size = 0;
   uint64_t total = 0;
   int e = read_and_check_header(is, &block_size, &total);
@@ -1479,6 +1538,21 @@ int decompress_file(const std::string &in_path, const std::string &out_path,
     }
     if (raw_out) *raw_out = produced;
     if (crc_out) *crc_out = 0; // bare form stores data verbatim (no checksum)
+    return os ? SZIP_OK : SZIP_ERR_IO;
+  }
+  if (is_compact_magic(magic)) {
+    if ((magic[3] & 0x3F) > SZIP_VERSION) return SZIP_ERR_UNSUPPORTED;
+    is.seekg(0, std::ios::end);
+    const uint64_t flen = (uint64_t)is.tellg();
+    is.seekg(4);
+    std::ofstream os(out_path, std::ios::binary | std::ios::trunc);
+    if (!os) return SZIP_ERR_IO;
+    uint32_t crc = 0;
+    uint64_t produced = 0;
+    const int we = walk_blocks_v7(is, flen, nullptr, &os, &crc, &produced);
+    if (we != SZIP_OK) return we;
+    if (raw_out) *raw_out = produced;
+    if (crc_out) *crc_out = crc;
     return os ? SZIP_OK : SZIP_ERR_IO;
   }
   is.seekg(0);
@@ -1557,6 +1631,17 @@ int test_file(const std::string &in_path, uint64_t *raw_out) {
     const uint64_t produced = (uint64_t)is.tellg() - 4;
     if (raw_out) *raw_out = produced;
     return SZIP_OK; // verbatim storage: nothing further to validate
+  }
+  if (is_compact_magic(magic)) {
+    if ((magic[3] & 0x3F) > SZIP_VERSION) return SZIP_ERR_UNSUPPORTED;
+    is.seekg(0, std::ios::end);
+    const uint64_t flen = (uint64_t)is.tellg();
+    is.seekg(4);
+    uint64_t produced = 0;
+    const int we = walk_blocks_v7(is, flen, nullptr, nullptr, nullptr, &produced);
+    if (we != SZIP_OK) return we;
+    if (raw_out) *raw_out = produced;
+    return SZIP_OK;
   }
   is.seekg(0);
 
