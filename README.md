@@ -125,6 +125,9 @@ of the same deterministic corpora; gzip/bzip2/xz re-measure each run
 | utf8 (131,072) | **14,763** | 23,091 | 14,981 | 21,212 | 20,989 | 20,973 | 28,341 | 41,912 |
 | xml (131,072) | **13,914** | 20,903 | 13,835 | 17,768 | 18,924 | 17,142 | 25,667 | 34,636 |
 
+Full speed + size benchmark report (encode/decode wall times per corpus,
+aggregates, methodology): [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
 Win/loss against the best alternative on each corpus (the written check is
 `sh tests/benchall.sh` / `python3 tests/benchall.py`, every roundtrip
 byte-exact; zstd/brotli/lz4/snappy columns frozen from the v5 run of the
