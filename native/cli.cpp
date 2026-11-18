@@ -98,6 +98,8 @@ int cmd_info(const char *path) {
 } // namespace
 
 int main(int argc, char **argv) {
+  szip::set_parse_tier("hyper");
+  if (const char *envt = std::getenv("SZIP_TIER")) szip::set_parse_tier(envt);
   if (argc < 2) {
     // GUI is the default entry point: plain `g0dszip` opens it.
     return szip::run_gui(8848);
@@ -133,8 +135,13 @@ int main(int argc, char **argv) {
           return 2;
         }
         i += 2;
+      } else if (std::strcmp(argv[i], "--max") == 0) {
+        szip::set_parse_tier("max");
+        fast = 0;
+        i += 1;
       } else if (std::strcmp(argv[i], "-f") == 0 ||
                  std::strcmp(argv[i], "--fast") == 0) {
+        szip::set_parse_tier("fast");
         fast = 1;
         i += 1;
       } else {

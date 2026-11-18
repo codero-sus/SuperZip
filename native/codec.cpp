@@ -411,6 +411,17 @@ thread_local double plan_cost_estimate = 0;
 #endif
 // Encoder-side parse knob (set_parse_fast): 0 = max ratio, 1 = fast parse.
 static thread_local int g_parse_fast = 0;
+// Hyper tier knobs (set_parse_tier): cache-resident pricing mixer, fewer
+// refinement passes, tighter candidate diet, incompressible pre-reject.
+// Plain globals (NOT thread_local): worker threads must see the same tier
+// as the thread that called set_parse_tier.
+static int g_parse_light = 0;
+static int g_kmax = 2;   // 0 = default (SZ_PASSES)
+static int g_mcc = 2;    // 0 = default (SZ_MCAND path)
+static int g_prereject = 1;
+static int g_beam_ovr = 1;
+static int g_modeset = 12; // bitmask of emitted modes (tight pair)
+
 // rank 0 = best candidate (fine lengths); rank > 0 = secondary (coarse).
 static void collect_lens(uint32_t max_len, uint32_t rank,
                          std::vector<uint32_t> &lens) {
@@ -545,7 +556,7 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
 
   Model ms(mode >= 2 ? 2u : 0u); // online-calibrated price model
   std::unique_ptr<MixLit> mix;   // live literal prices (unguided pass only)
-  if (!guide) mix.reset(new MixLit(mode & 1u));
+  if (!guide) mix.reset(new MixLit(mode & 1u, g_parse_light != 0));
   Hist hist;
 
   std::vector<DPNode> pool;
@@ -569,7 +580,8 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
   best_cnt[0] = 1;
 
   const uint32_t beam_cap =
-      g_parse_fast ? (g_parse_fast >= 2 ? 2u : 4u)
+      g_beam_ovr ? (uint32_t)g_beam_ovr
+      : g_parse_fast ? (g_parse_fast >= 2 ? 2u : 4u)
       : (guide ? ((uint32_t)SZ_GBEAM < kBeamSlots ? (uint32_t)SZ_GBEAM
                                                : kBeamSlots)
                : kDPBeam);
@@ -633,8 +645,10 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
   std::vector<uint32_t> lenst(kMaxMatch + 1, 0);
   uint32_t lenst_cur = 0;
 
+  double tp_peek = 0, tp_dp = 0, tp_rep = 0, tp_norm = 0;
   for (uint32_t pos = 0; pos < n; ++pos) {
     if (best_cnt[pos] == 0) continue;
+    auto __t0 = std::chrono::steady_clock::now();
 
     // calibrate the price model
     uint8_t mb = 0;
@@ -666,14 +680,18 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
     if (guide) {
       litp = litp_cache[pos]; // exact price cached by the unguided pass
     } else {
+      auto __t1 = std::chrono::steady_clock::now();
       litp = mix->peek(hist, src[pos], mb, st);
       litp_cache[pos] = litp;
+      tp_peek += std::chrono::duration<double>(std::chrono::steady_clock::now() - __t1).count();
     }
+    tp_dp += std::chrono::duration<double>(std::chrono::steady_clock::now() - __t0).count();
 #if SZ_STATS
     plan_cost_estimate += (double)litp; // debug: sum of literal prices
 #endif
     Match cands[16];
-    const uint32_t mcc = g_parse_fast ? 6u : (uint32_t)SZ_MCAND;
+    const uint32_t mcc = g_mcc ? (uint32_t)g_mcc
+                               : g_parse_fast ? 6u : (uint32_t)SZ_MCAND;
     const uint32_t ncand = SZ_DP_NO_NORM ? 0u : cc.cnt[pos];
     for (uint32_t i = 0; i < ncand && i < mcc; ++i)
       cands[i] = cc.m[(size_t)pos * SZ_CANDW + i];
@@ -726,6 +744,7 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
       }
 
       // rep edges from this arrival's offsets
+      auto __t3 = std::chrono::steady_clock::now();
       if (!SZ_DP_NO_REP) {
         const RepPick rep = rep_match(src, n, pos, A.reps);
         if (rep.len >= kMinMatch) {
@@ -773,6 +792,8 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
         }
       }
 
+      tp_rep += std::chrono::duration<double>(std::chrono::steady_clock::now() - __t3).count();
+      auto __t4 = std::chrono::steady_clock::now();
       // normal-match edges: every candidate distance, priced exactly
       for (uint32_t ci = 0; ci < ncand && ci < mcc; ++ci) {
         const Match &nm = cands[ci];
@@ -790,11 +811,21 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
           try_insert(pos + l, nd);
         }
       }
+      tp_norm += std::chrono::duration<double>(std::chrono::steady_clock::now() - __t4).count();
     }
-
+    auto __t5 = std::chrono::steady_clock::now();
     // advance the raw-prefix model after pricing this position (unguided only)
     if (!guide) mix->train_byte(hist, src[pos], mb, st);
+#if SZ_TIME
+    tp_dp += std::chrono::duration<double>(std::chrono::steady_clock::now() - __t5).count();
+#else
+    (void)__t5;
+#endif
   }
+#if SZ_TIME
+  fprintf(stderr, "[pp] n=%u guide=%d calib=%6.3f peek=%6.3f rep=%6.3f norm=%6.3f\n",
+          n, guide ? 1 : 0, tp_dp, tp_peek, tp_rep, tp_norm);
+#endif
 
 #if SZ_STATS
   fprintf(stderr, "[pool] mode=%u guide=%d n=%u pool=%zu cap=%zu\n",
@@ -950,7 +981,8 @@ static void encode_one_mode(const uint8_t *src, uint32_t n, uint32_t mode,
   SZ_TIC(t0);
   plan_block_pass(src, n, plans[0], nullptr, mode, cc, litp_cache);
   size_t nplans = 1;
-  const size_t kmax_pass = (g_parse_fast >= 2) ? 2u : (size_t)SZ_PASSES;
+  const size_t kmax_pass = g_kmax ? (size_t)g_kmax
+                                  : (g_parse_fast >= 2) ? 2u : (size_t)SZ_PASSES;
   for (size_t k = 1; k < kmax_pass; ++k) {
     plan_block_pass(src, n, plans[k], &plans[k - 1], mode, cc, litp_cache);
     nplans = k + 1;
@@ -981,6 +1013,22 @@ void encode_block_szlzrc(const uint8_t *src, uint32_t n,
                          std::vector<uint8_t> &out) {
   out.clear();
   if (n == 0) return;
+  // Incompressible pre-reject (hyper/fast tiers): when the byte entropy is
+  // within 0.02 bits/byte of random, no coder can beat the bare frame by a
+  // meaningful margin.  Return the raw block so the container stores it —
+  // the output is exactly what the full search produces for such data.
+  if (g_prereject && n >= 4096) {
+    uint32_t cnt[256] = {0};
+    for (uint32_t i = 0; i < n; ++i) ++cnt[src[i]];
+    double h = 0.0;
+    for (uint32_t c : cnt)
+      if (c) h += (double)c * -__builtin_log2((double)c / (double)n);
+    if (h >= 7.98 * (double)n) {
+      out.push_back((uint8_t)(7u << 3)); // stored sub-mode (delta_id 7)
+      out.insert(out.end(), src, src + n);
+      return;
+    }
+  }
   SZ_TIC(tc);
   CandCache cc;
   build_cand_cache(src, n, cc);
@@ -1044,7 +1092,8 @@ void encode_block_szlzrc(const uint8_t *src, uint32_t n,
     SZ_TIC(tp0);
     plan_block_pass(src, n, plan, nullptr, 2, cc, litp_cache);
     SZ_TOC(tp0, "pass 0 (unguided)");
-    const size_t kmax_pass = (g_parse_fast >= 2) ? 2u : (size_t)SZ_PASSES;
+    const size_t kmax_pass = g_kmax ? (size_t)g_kmax
+                                    : (g_parse_fast >= 2) ? 2u : (size_t)SZ_PASSES;
     for (size_t k = 1; k < kmax_pass; ++k) {
       prev.clear();
       prev.swap(plan);
@@ -1062,16 +1111,16 @@ void encode_block_szlzrc(const uint8_t *src, uint32_t n,
       for (unsigned t = 0; t < ew; ++t)
         ths.emplace_back([&, t] {
           for (uint32_t m = t; m < 4; m += ew)
-            emit_plan(src, n, plan, cand[m], m);
+            if (g_modeset & (1 << m)) emit_plan(src, n, plan, cand[m], m);
         });
       for (auto &th : ths) th.join();
     }
     SZ_TOC(te, "emits (x4)");
   }
   set_parse_fast(user_fast ? 1 : 0);
-  uint32_t best = 0;
-  for (uint32_t k = 1; k < 4; ++k)
-    if (cand[k].size() < cand[best].size()) best = k;
+  uint32_t best = UINT32_MAX;
+  for (uint32_t k = 0; k < 4; ++k)
+    if ((g_modeset & (1 << k)) && (best == UINT32_MAX || cand[k].size() < cand[best].size())) best = k;
   const size_t cheap_best = cand[best].size();
   // (the BWT/delta family has been running concurrently since the top of
   // this function — join it now)
@@ -1104,9 +1153,9 @@ void encode_block_szlzrc(const uint8_t *src, uint32_t n,
     }
     for (uint32_t k = 0; k < 4; ++k)
       if (deep[k].size() < cand[k].size()) cand[k].swap(deep[k]);
-    best = 0;
-    for (uint32_t k = 1; k < 4; ++k)
-      if (cand[k].size() < cand[best].size()) best = k;
+    best = UINT32_MAX;
+    for (uint32_t k = 0; k < 4; ++k)
+      if ((g_modeset & (1 << k)) && (best == UINT32_MAX || cand[k].size() < cand[best].size())) best = k;
   }
   if (best_bwt.size() < cand[best].size()) {
     out.push_back((uint8_t)((best_delta << 3) | 4u));
@@ -1124,6 +1173,13 @@ int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
   const uint32_t mode = src[0];
   const uint32_t delta_id = (mode >> 3) & 7u;
   static const uint32_t kDeltas[5] = {0, 1, 2, 4, 8};
+  // delta_id 7 (bit 2 clear) = stored sub-mode: payload is mode byte + raw.
+  // Used by the incompressible pre-reject; containers strip it to raw anyway.
+  if (delta_id == 7 && !(mode & 4u)) {
+    if (src_len != (size_t)n + 1) return SZIP_ERR_FORMAT;
+    if (n) std::memcpy(dst, src + 1, n);
+    return SZIP_OK;
+  }
   if (delta_id > 4) return SZIP_ERR_CORRUPT;
   const uint32_t delta = kDeltas[delta_id];
   if (mode & 4u) {
@@ -1328,6 +1384,30 @@ int read_and_check_block_header(std::istream &is, uint8_t *type,
 // ------------------------------------------------------------- container --
 
 void set_parse_fast(int fast) { g_parse_fast = fast < 0 ? 0 : fast; }
+
+void set_parse_tier(const char *tier) {
+  if (!tier || !*tier) return;
+  if (std::strcmp(tier, "max") == 0) {
+    // Byte-exact deep search: the historical engine (golden sizes).
+    g_parse_light = 0; g_kmax = 0; g_mcc = 0; g_prereject = 0;
+    g_beam_ovr = 0; g_modeset = 15;
+  } else if (std::strcmp(tier, "fast") == 0) {
+    // Speed freak: no refinement pass at all, tiny pricing mixer.
+    g_parse_light = 1; g_kmax = 1; g_mcc = 2; g_prereject = 1;
+    g_beam_ovr = 1; g_modeset = 12;
+  } else { // "hyper" — default reality-bend tier
+    // Ablation-verified: keeps every win row of the 14W/6L scoreboard.
+    g_parse_light = 0; g_kmax = 2; g_mcc = 2; g_prereject = 1;
+    g_beam_ovr = 1; g_modeset = 12; // emit the tight-regime pair only
+  }
+  // Ablation/debug overrides: SZIP_LIGHT=0/1 SZIP_KMAX=n SZIP_MCC=n
+  if (const char *e = std::getenv("SZIP_LIGHT")) g_parse_light = std::atoi(e);
+  if (const char *e = std::getenv("SZIP_KMAX")) g_kmax = std::atoi(e);
+  if (const char *e = std::getenv("SZIP_MCC")) g_mcc = std::atoi(e);
+  if (const char *e = std::getenv("SZIP_BEAM")) g_beam_ovr = std::atoi(e);
+  if (const char *e = std::getenv("SZIP_MODESET")) g_modeset = std::atoi(e);
+  if (const char *e = std::getenv("SZIP_MODES")) g_modeset = (1 << std::atoi(e)) - 1;
+}
 
 int compress_file(const std::string &in_path, const std::string &out_path,
                   uint32_t block_size) {

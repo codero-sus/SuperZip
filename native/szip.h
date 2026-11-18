@@ -77,7 +77,9 @@ struct Header {
   uint64_t total_raw = 0;
 };
 
-void set_parse_fast(int fast); // 0 = max ratio (default), 1 = fast parse
+void set_parse_fast(int fast);
+// Search tier: "hyper" (default), "fast", or "max" (byte-exact deep search).
+void set_parse_tier(const char *tier); // 0 = max ratio (default), 1 = fast parse
 int compress_file(const std::string &in_path, const std::string &out_path,
                   uint32_t block_size = SZIP_DEFAULT_BLOCK_SIZE);
 int compress_buffer(const uint8_t *data, size_t len, std::vector<uint8_t> &out,

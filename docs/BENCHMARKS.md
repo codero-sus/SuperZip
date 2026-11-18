@@ -1,6 +1,6 @@
 # G0D SZIP — Benchmarks (speed & size)
 
-Engine **v8 / SZLZRC v7 format** (ULTRA speed pass). 20 deterministic
+Engine **v8 / SZLZRC v7 format** (hyper tier — default). 20 deterministic
 benchmark corpora (`tests/mkcorpus.sh` + `tests/corpus20.py` regenerate
 them). Every roundtrip is byte-exact (`cmp`). Wall times are single-run
 indicative numbers measured on a 2-core machine; reproduce with
@@ -52,16 +52,16 @@ fixed corpora).
 | html | 12,015 | bzip2 12,036 | **+0.17%** | WIN |
 | json | 10,752 | bzip2 11,133 | **+3.42%** | WIN |
 | log | 8,917 | bzip2 8,948 | **+0.35%** | WIN |
-| mixed | 52,067 | xz 53,240 | **+2.20%** | WIN |
+| mixed | 51,962 | xz 53,240 | **+2.40%** | WIN |
 | pcm | 101,873 | brotli 114,926 | **+11.36%** | WIN |
 | prose | 26,408 | bzip2 28,427 | **+7.10%** | WIN |
 | sparse | 780 | brotli 786 | **+0.76%** | WIN |
 | utf8 | 14,763 | bzip2 14,981 | **+1.46%** | WIN |
-| code | 17,186 | brotli 16,894 | -1.73% | loss |
-| src | 52,132 | brotli 50,871 | -2.48% | loss |
+| code | 17,218 | brotli 16,894 | -1.92% | loss |
+| src | 52,796 | brotli 50,871 | -3.78% | loss |
 | binary | 64,266 | brotli 63,470 | -1.25% | loss |
-| dict | 34,438 | brotli 28,837 | -19.42% | loss |
-| floats | 92,795 | xz 84,992 | -9.18% | loss |
+| dict | 35,057 | brotli 28,837 | -21.57% | loss |
+| floats | 93,406 | xz 84,992 | -9.90% | loss |
 | xml | 13,914 | bzip2 13,835 | -0.57% | loss |
 
 ## Encode speed (seconds, lower is better)
@@ -119,62 +119,77 @@ fixed corpora).
 ## Aggregate (20 corpora)
 
 - total raw: **3,445,277 B** (3.45 MB)
-- total G0D SZIP: **1,165,566 B** (33.83% of raw) vs best-per-row alternatives 1,174,428 B — **+0.75%**
-- total encode wall: G0D **68.9 s** (0.05 MB/s), G0D -f 50.6 s, gzip 0.50 s, bzip2 0.36 s, xz 1.44 s
-- total decode wall: G0D **4.8 s** (0.7 MB/s), gzip 0.04 s, bzip2 0.23 s, xz 0.17 s
+- total G0D SZIP: **1,167,387 B** (33.88% of raw) vs best-per-row alternatives 1,174,428 B — **+0.60%**
+  (deep tier `--max`: 1,165,566 B, +0.75%)
+- total encode wall: G0D **29.1 s** (0.12 MB/s), G0D -f ~22 s, gzip 0.50 s, bzip2 0.36 s, xz 1.44 s
+- total decode wall: G0D **3.85 s** (0.9 MB/s), gzip 0.04 s, bzip2 0.23 s, xz 0.17 s
 
-## Speed passes (byte-identical output)
+## Speed: the tier system (reality-bend pass)
 
-Every speed pass below reproduces the same `.szip` bytes as the v8 engine —
-size, ratios and the 14W/6L scoreboard cannot change. Verified by
-`tests/goldcheck.py` (20/20 rows byte-identical + roundtrip), `build/sztest`
-(all tests passed) and `tests/beatsniper.sh` (10/1, frozen result).
+`G0D SZIP` now has three search tiers. The **default ("hyper")** is tuned so
+the 14W/6L scoreboard above cannot regress (every win row's size is unchanged
+or better); `--max` reproduces the historical deep-search golden sizes
+byte-for-byte; `-f`/`--fast` is the speed freak.
 
-1. **ULTRA pass** (1.40x on top of v8): parallel match finder, bwt overlap,
-   SWAR rep-match, multi-block group-parallel, `best_worstc` fast-reject.
-2. **Hot-path pass** (another ~1.12x encode / ~1.16x decode on top of the
-   committed engine, best-of-2, 2 cores):
-   - `MixLit::peek()` rewritten as a pure-local walk (no 2 KB snapshot and
-     restore per DP position) — exact, the probability walk is a unique path.
-   - beam slots 32 -> 12 (exact: same extension order and limits).
-   - tree init: SIMD u16 fill + 2 MB-aligned `MADV_HUGEPAGE` blocks through
-     a small global allocator pool — the encode "emit" wall was mostly
-     DRAM/page-walk traffic over the 470 MB mixer trees (48 random cache
-     lines per byte), and huge pages removed the page-walk amplification.
-     A hard 512 MB pool cap keeps the 3.9 GB reference VM safe.
-   - emit workers made core-adaptive (2-4).
+| tier | flag | search | total encode (20 rows, 2 cores) |
+|---|---|---|---|
+| deep | `--max` | 4 passes, beam 4, 6 candidates, 4 mode emits | 65.1 s |
+| **hyper (default)** | *(none)* | 2 passes, beam 1, 2 candidates, 2 mode emits, incompressible pre-reject | **29.1 s (2.24x)** |
+| fast | `-f` | 1 pass, beam 1, 2 candidates, light pricing mixer | ~22 s (3x) |
 
-Best-of-2 wall, old = committed engine, new = hot-path engine:
+What the hyper tier does (each lever ablation-tested on all 20 rows before
+admission — `tests/scorecheck.py` is the gate):
 
-| row | enc old | enc new | up | dec old | dec new | up |
-|-----|--------:|--------:|---:|--------:|--------:|---:|
-| prose | 3.19 | 2.80 | 1.14x | 0.246 | 0.222 | 1.11x |
-| dict | 3.30 | 2.80 | 1.18x | 0.281 | 0.221 | 1.27x |
-| text | 9.11 | 8.87 | 1.03x | 0.330 | 0.275 | 1.20x |
-| code | 1.98 | 1.85 | 1.08x | 0.220 | 0.193 | 1.14x |
-| xml | 3.25 | 2.96 | 1.10x | 0.238 | 0.227 | 1.05x |
-| json | 3.21 | 2.92 | 1.10x | 0.229 | 0.217 | 1.06x |
-| log | 3.36 | 3.11 | 1.08x | 0.243 | 0.205 | 1.18x |
-| html | 3.48 | 3.21 | 1.09x | 0.238 | 0.216 | 1.10x |
-| csv | 3.23 | 2.78 | 1.16x | 0.254 | 0.203 | 1.25x |
-| utf8 | 3.01 | 2.79 | 1.08x | 0.227 | 0.203 | 1.12x |
-| b64 | 3.09 | 2.82 | 1.09x | 0.225 | 0.192 | 1.18x |
-| hex | 3.11 | 2.94 | 1.06x | 0.261 | 0.221 | 1.18x |
-| dna | 3.12 | 3.04 | 1.03x | 0.225 | 0.215 | 1.05x |
-| src | 5.74 | 5.14 | 1.12x | 0.316 | 0.282 | 1.12x |
-| floats | 2.49 | 2.01 | 1.24x | 0.302 | 0.260 | 1.16x |
-| pcm | 2.42 | 1.88 | 1.29x | 0.314 | 0.265 | 1.19x |
-| binary | 2.85 | 2.33 | 1.22x | 0.272 | 0.236 | 1.15x |
-| sparse | 2.60 | 2.54 | 1.02x | 0.216 | 0.188 | 1.15x |
-| mixed | 2.85 | 2.41 | 1.18x | 0.262 | 0.202 | 1.30x |
-| rand | 5.23 | 4.04 | 1.29x | 0.004 | 0.004 | 0.92x |
-| **TOTAL** | **70.64** | **63.24** | **1.12x** | **4.903** | **4.245** | **1.16x** |
+- **Incompressible pre-reject**: byte entropy within 0.02 bits of random →
+  stored sub-mode block (new v7 block mode, `delta_id=7`), no search at all.
+  `rand` encodes in 0.01 s and keeps its exact 500,004 B win.
+- **2 refinement passes instead of 4**: the 3rd/4th guided passes buy
+  <=0.2% on 3 rows and nothing on the rest. Dropping them keeps every win;
+  dropping to 1 pass flips `sparse` to a loss, so 2 is the floor.
+- **beam 1 + 2 candidates**: the DP's per-position edge work drops ~6x;
+  measured size cost is +0.2-1.3% on five rows only, all loss rows or
+  comfortably-margined wins.
+- **Emit the tight-regime mode pair only** ({2,3}): measured identical to
+  min-of-4 on every row at half the emit cost.
+- Keepers: the huge-page mixer pool, SIMD init, `peek()` local-walk, beam
+  stride 12, core-adaptive emit workers (all from the previous byte-exact
+  pass).
 
-A second interleaved run of the same pair measured 69.54 -> 60.73 s (1.15x)
-encode and 5.02 -> 4.36 s (1.15x) decode; sandbox timing noise is a few
-percent, so claim ~1.1-1.15x encode and ~1.15-1.25x decode on top of the
-ULTRA engine. Combined with the ULTRA pass this is ~1.55-1.6x over the raw
-v8 engine, still at identical bytes.
+Best-of-2 wall, deep tier vs hyper tier (2 cores):
+
+| row | enc deep | enc hyper | up | row | enc deep | enc hyper | up |
+|-----|--------:|--------:|---:|-----|--------:|--------:|---:|
+| prose | 2.86 | 1.28 | 2.23x | b64 | 2.92 | 1.40 | 2.09x |
+| dict | 2.83 | 1.44 | 1.97x | hex | 2.79 | 1.38 | 2.03x |
+| text | 9.53 | 3.28 | 2.90x | dna | 2.95 | 1.44 | 2.05x |
+| code | 1.62 | 1.04 | 1.57x | src | 5.26 | 1.94 | 2.71x |
+| xml | 3.00 | 1.47 | 2.04x | floats | 1.88 | 1.28 | 1.47x |
+| json | 2.98 | 1.54 | 1.94x | pcm | 1.75 | 1.54 | 1.14x |
+| log | 3.52 | 1.44 | 2.45x | binary | 2.63 | 1.57 | 1.67x |
+| html | 3.35 | 1.38 | 2.42x | sparse | 2.47 | 1.29 | 1.92x |
+| csv | 2.99 | 1.51 | 1.98x | mixed | 2.57 | 1.34 | 1.93x |
+| utf8 | 2.93 | 1.52 | 1.93x | rand | 4.28 | 0.00 | 1244x |
+| **TOTAL** | **65.12** | **29.06** | **2.24x** | decode TOTAL | 3.92 | 3.85 | 1.02x |
+
+Earlier byte-exact stack (still present in `--max`): huge-page mixer pool
+(DRAM page-walk traffic was the emit wall), `peek()` local-walk, beam stride
+32->12, SIMD init = 1.12-1.15x encode / 1.16-1.25x decode on top of the raw
+v8 engine at identical bytes.
+
+Verification (all written, runnable):
+- `python3 tests/goldcheck.py` — `--max` reproduces all 20 frozen golden
+  sizes + roundtrips; default tier roundtrips (20/20).
+- `python3 tests/scorecheck.py` — **14W/6L scoreboard gate**: every golden
+  win still wins vs the frozen best-alternative size (20/20, PASSED).
+- `build/sztest` — all tests passed (298 corruption rejected, CRC-gated).
+- `sh tests/beatsniper.sh` — 10/1 (frozen result: the 16,933 B stretch).
+- `stdbuf -oL python3 -u tests/benchall.py` — full table above
+  (`docs/bench20_hyper.txt`), 100/100 roundtrips.
+
+Aggregate (20 corpora, hyper tier): total raw 3,445,277 B -> G0D
+**1,167,387 B (33.88%)** vs best-per-row alternatives 1,174,428 B —
+**+0.60%** aggregate (deep tier: +0.75%; the give-back is honest and
+bounded to five rows).
 
 ## Notes
 

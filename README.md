@@ -174,16 +174,26 @@ Decode is single-pass 0.2-0.4 s and scales with block count. gzip/xz remain
 faster encoders at far worse ratios; G0D SZIP trades encode search for wins
 on 14 of 20 types.
 
-**Speed (the hot-path pass, still byte-identical)**: on top of ULTRA, the
-parse hot loop lost its per-position mixer snapshot/restore (peek is now a
-pure-local walk), beam width dropped 32 -> 12, and the 470 MB mixer trees
-now come from a tiny 2 MB-aligned `MADV_HUGEPAGE` pool with SIMD init —
-the emit wall was DRAM page-walk traffic, not math. Best-of-2 on 2 cores:
-**1.12-1.15x encode and 1.16-1.25x decode** on top of the ULTRA engine
-(pcm 1.29x, rand 1.29x, floats 1.24x encode), ~1.55-1.6x combined over the
-raw v8 engine at identical bytes. Verified: `tests/goldcheck.py` 20/20,
+**Speed (the reality-bend pass — 2.24x, 14W/6L held)**: the default
+"hyper" tier now spends its search where it pays. The 3rd/4th refinement
+passes are gone (they bought <=0.2% on three rows), the DP beam is 1 with
+2 candidates (6x less per-position edge work), only the tight-regime mode
+pair emits (measured identical to min-of-4 at half the cost), and
+incompressible blocks are rejected by byte entropy before any search —
+`rand` encodes in 0.01 s at the same 500,004 B. Total encode for the
+20-row corpus: **65 s -> 29 s** (text 2.90x, src 2.71x, rand 1244x).
+Every lever was ablation-tested on all 20 rows; `tests/scorecheck.py` is
+the **no-loses gate** (14 golden wins must keep winning): PASSED. Sizes
+moved <=2% on five rows only (all loss rows or wide wins; `mixed` actually
+improved to +2.40%). `--max` reproduces the historical golden sizes
+byte-for-byte; `-f` is the speed freak (~22 s). The byte-exact pass below
+still lives in `--max`. Verified: `tests/goldcheck.py` 20/20,
 `build/sztest` all-passed, `tests/beatsniper.sh` 10/1. Tables in
 [BENCHMARKS.md](docs/BENCHMARKS.md).
+
+**Byte-exact pass (still in `--max`)**: huge-page mixer pool (the emit wall
+was DRAM page-walk traffic over the 470 MB trees, not math), `peek()`
+local-walk, beam stride 32 -> 12, SIMD tree init.
 
 What remains: **dict** (brotli's static-model niche, −19%), **floats**
 (xz's filters own structured high-entropy binary; the ARF float coder is

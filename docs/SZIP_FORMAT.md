@@ -102,6 +102,11 @@ bit 0    mixer        (LZ path)
 bit 1    regime       (LZ path)
 bit 2    codec: 0 = SZLZRC (LZ), 1 = BWT (see §2.7)
 bits 3-5 delta id    (0 = none, 1 = d1, 2 = d2, 3 = d4, 4 = d8; see below)
+         7 = **stored sub-mode** (bit 2 must be 0): payload is exactly
+         1 + raw_size bytes = mode byte + the raw block.  Emitted by the
+         incompressible pre-reject; containers with a raw/stored block type
+         strip the mode byte and store the raw block instead.  ids 5-6
+         are reserved and decoders must reject them.
 bits 6-7 reserved, zero
 ```
 

@@ -211,17 +211,29 @@ struct MixLit {
   int32_t ts_ = SZ_TREESHIFT;
   int32_t wsh_ = SZ_WSHIFT;
   int32_t esh_ = SZ_ERRSHIFT;
+  // "light" pricing mixer: same model shape, cache-resident tree sizes.
+  // Used by the DP pricer only — the emitter/decoder keep the full mixer,
+  // so light-mode pricing changes search decisions, never the format.
+  bool light_ = false;
+  uint32_t m1_ = 65535, m2_ = (1u << SZ_O3BITS) - 1, m3_ = (1u << SZ_O4BITS) - 1,
+           m4_ = (1u << SZ_O5BITS) - 1, m5_ = 65535;
 
-  explicit MixLit(uint32_t mode = 0) : gap_mode(mode) {
+  explicit MixLit(uint32_t mode = 0, bool light = false) : gap_mode(mode), light_(light) {
     ts_ = gap_mode ? SZ_TREESHIFT_B : SZ_TREESHIFT;
     wsh_ = gap_mode ? SZ_WSHIFT_B : SZ_WSHIFT;
     esh_ = gap_mode ? SZ_ERRSHIFT_B : SZ_ERRSHIFT;
+    uint32_t r1 = SZ_O1EXACT ? 65536u : 8192u, r2 = 1u << SZ_O3BITS,
+             r3 = 1u << SZ_O4BITS, r4 = 1u << SZ_O5BITS, r5 = 65536u;
+    if (light_) { // ~24 MB total: fits L3 on real boxes, kills page walks
+      r1 = 4096; r2 = 1u << 14; r3 = 1u << 14; r4 = 0; r5 = 8192;
+    }
+    m1_ = r1 - 1; m2_ = r2 - 1; m3_ = r3 - 1; m4_ = r4 ? r4 - 1 : 0; m5_ = r5 - 1;
     { const size_t nn = (size_t)((SZ_STATE ? 96u : 32u) * 256); t[0].resize(nn); szip_fill16(t[0].data(), nn, (uint16_t)kProbInit); }
-    { const size_t nn = (size_t)((SZ_O1EXACT ? 65536u : 8192u) * 256); t[1].resize(nn); szip_fill16(t[1].data(), nn, (uint16_t)kProbInit); }
-    { const size_t nn = (size_t)((1u << SZ_O3BITS) * 256); t[2].resize(nn); szip_fill16(t[2].data(), nn, (uint16_t)kProbInit); }
-    { const size_t nn = (size_t)((1u << SZ_O4BITS) * 256); t[3].resize(nn); szip_fill16(t[3].data(), nn, (uint16_t)kProbInit); }
-    if (SZ_ORDER5) { const size_t nn = (size_t)((1u << SZ_O5BITS) * 256); t[4].resize(nn); szip_fill16(t[4].data(), nn, (uint16_t)kProbInit); }
-    { const size_t nn = (size_t)(65536 * 256); t[5].resize(nn); szip_fill16(t[5].data(), nn, (uint16_t)kProbInit); } // (wpos, prev, pprev>>3) word shape
+    { const size_t nn = (size_t)r1 * 256; t[1].resize(nn); szip_fill16(t[1].data(), nn, (uint16_t)kProbInit); }
+    { const size_t nn = (size_t)r2 * 256; t[2].resize(nn); szip_fill16(t[2].data(), nn, (uint16_t)kProbInit); }
+    { const size_t nn = (size_t)r3 * 256; t[3].resize(nn); szip_fill16(t[3].data(), nn, (uint16_t)kProbInit); }
+    if (SZ_ORDER5 && r4) { const size_t nn = (size_t)r4 * 256; t[4].resize(nn); szip_fill16(t[4].data(), nn, (uint16_t)kProbInit); }
+    { const size_t nn = (size_t)r5 * 256; t[5].resize(nn); szip_fill16(t[5].data(), nn, (uint16_t)kProbInit); } // (wpos, prev, pprev>>3) word shape
     for (auto &row : w)
       for (auto &x : row) x = (1 << kWShift) / 6; // start as equal mix
   }
@@ -331,10 +343,10 @@ struct MixLit {
     uint32_t sym = 1;
     for (int k = 7; k >= 0; --k) {
       const uint32_t bit = (b >> k) & 1;
-      Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][c1 * 256 + sym];
-      Prob *n2 = &t[2][c2 * 256 + sym], *n3 = &t[3][c3 * 256 + sym];
-      Prob *n4 = (SZ_ORDER5 && !(gap_mode && SZ_NO5_B)) ? &t[4][c5 * 256 + sym] : nullptr;
-      Prob *n5 = &t[5][cw * 256 + sym];
+      Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][(c1 & m1_) * 256 + sym];
+      Prob *n2 = &t[2][(c2 & m2_) * 256 + sym], *n3 = &t[3][(c3 & m3_) * 256 + sym];
+      Prob *n4 = (SZ_ORDER5 && !light_ && !(gap_mode && SZ_NO5_B)) ? &t[4][(c5 & m4_) * 256 + sym] : nullptr;
+      Prob *n5 = &t[5][(cw & m5_) * 256 + sym];
       const uint32_t wk = wctx((uint32_t)(7 - k), h, st);
       const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5);
       train(wk, n0, n1, n2, n3, n4, n5, bit, p);
@@ -353,10 +365,10 @@ struct MixLit {
     uint32_t sym = 1;
     for (int k = 7; k >= 0; --k) {
       const uint32_t bit = (b >> k) & 1;
-      Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][c1 * 256 + sym];
-      Prob *n2 = &t[2][c2 * 256 + sym], *n3 = &t[3][c3 * 256 + sym];
-      Prob *n4 = (SZ_ORDER5 && !(gap_mode && SZ_NO5_B)) ? &t[4][c5 * 256 + sym] : nullptr;
-      Prob *n5 = &t[5][cw * 256 + sym];
+      Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][(c1 & m1_) * 256 + sym];
+      Prob *n2 = &t[2][(c2 & m2_) * 256 + sym], *n3 = &t[3][(c3 & m3_) * 256 + sym];
+      Prob *n4 = (SZ_ORDER5 && !light_ && !(gap_mode && SZ_NO5_B)) ? &t[4][(c5 & m4_) * 256 + sym] : nullptr;
+      Prob *n5 = &t[5][(cw & m5_) * 256 + sym];
       const uint32_t wk = wctx((uint32_t)(7 - k), h, st);
       const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5);
 #if SZ_STATS
@@ -378,10 +390,10 @@ struct MixLit {
     const uint32_t cw = hw(h, mb);
     uint32_t sym = 1;
     for (int k = 0; k < 8; ++k) {
-      Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][c1 * 256 + sym];
-      Prob *n2 = &t[2][c2 * 256 + sym], *n3 = &t[3][c3 * 256 + sym];
-      Prob *n4 = (SZ_ORDER5 && !(gap_mode && SZ_NO5_B)) ? &t[4][c5 * 256 + sym] : nullptr;
-      Prob *n5 = &t[5][cw * 256 + sym];
+      Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][(c1 & m1_) * 256 + sym];
+      Prob *n2 = &t[2][(c2 & m2_) * 256 + sym], *n3 = &t[3][(c3 & m3_) * 256 + sym];
+      Prob *n4 = (SZ_ORDER5 && !light_ && !(gap_mode && SZ_NO5_B)) ? &t[4][(c5 & m4_) * 256 + sym] : nullptr;
+      Prob *n5 = &t[5][(cw & m5_) * 256 + sym];
       const uint32_t wk = wctx((uint32_t)k, h, st);
       const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5);
       const uint32_t bit = rc.decode_bit_p(p);
@@ -411,11 +423,11 @@ struct MixLit {
     for (int k = 7; k >= 0; --k) {
       const int step = 7 - k;
       const Prob *srcs[6] = {
-          &t[0][c0 * 256 + sym], &t[1][c1 * 256 + sym],
-          &t[2][c2 * 256 + sym], &t[3][c3 * 256 + sym],
-          (SZ_ORDER5 && !(gap_mode && SZ_NO5_B)) ? &t[4][c5 * 256 + sym]
+          &t[0][c0 * 256 + sym], &t[1][(c1 & m1_) * 256 + sym],
+          &t[2][(c2 & m2_) * 256 + sym], &t[3][(c3 & m3_) * 256 + sym],
+          (SZ_ORDER5 && !light_ && !(gap_mode && SZ_NO5_B)) ? &t[4][(c5 & m4_) * 256 + sym]
                                                  : nullptr,
-          &t[5][cw * 256 + sym]};
+          &t[5][(cw & m5_) * 256 + sym]};
       for (int j = 0; j < 6; ++j) n[step][j] = srcs[j] ? *srcs[j] : (Prob)0;
       wks[step] = wctx((uint32_t)(7 - k), h, st);
       for (int j = 0; j < 6; ++j) wl[step][j] = w[wks[step]][j];
