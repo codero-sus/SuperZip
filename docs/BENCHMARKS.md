@@ -123,12 +123,66 @@ fixed corpora).
 - total encode wall: G0D **68.9 s** (0.05 MB/s), G0D -f 50.6 s, gzip 0.50 s, bzip2 0.36 s, xz 1.44 s
 - total decode wall: G0D **4.8 s** (0.7 MB/s), gzip 0.04 s, bzip2 0.23 s, xz 0.17 s
 
+## Speed passes (byte-identical output)
+
+Every speed pass below reproduces the same `.szip` bytes as the v8 engine —
+size, ratios and the 14W/6L scoreboard cannot change. Verified by
+`tests/goldcheck.py` (20/20 rows byte-identical + roundtrip), `build/sztest`
+(all tests passed) and `tests/beatsniper.sh` (10/1, frozen result).
+
+1. **ULTRA pass** (1.40x on top of v8): parallel match finder, bwt overlap,
+   SWAR rep-match, multi-block group-parallel, `best_worstc` fast-reject.
+2. **Hot-path pass** (another ~1.12x encode / ~1.16x decode on top of the
+   committed engine, best-of-2, 2 cores):
+   - `MixLit::peek()` rewritten as a pure-local walk (no 2 KB snapshot and
+     restore per DP position) — exact, the probability walk is a unique path.
+   - beam slots 32 -> 12 (exact: same extension order and limits).
+   - tree init: SIMD u16 fill + 2 MB-aligned `MADV_HUGEPAGE` blocks through
+     a small global allocator pool — the encode "emit" wall was mostly
+     DRAM/page-walk traffic over the 470 MB mixer trees (48 random cache
+     lines per byte), and huge pages removed the page-walk amplification.
+     A hard 512 MB pool cap keeps the 3.9 GB reference VM safe.
+   - emit workers made core-adaptive (2-4).
+
+Best-of-2 wall, old = committed engine, new = hot-path engine:
+
+| row | enc old | enc new | up | dec old | dec new | up |
+|-----|--------:|--------:|---:|--------:|--------:|---:|
+| prose | 3.19 | 2.80 | 1.14x | 0.246 | 0.222 | 1.11x |
+| dict | 3.30 | 2.80 | 1.18x | 0.281 | 0.221 | 1.27x |
+| text | 9.11 | 8.87 | 1.03x | 0.330 | 0.275 | 1.20x |
+| code | 1.98 | 1.85 | 1.08x | 0.220 | 0.193 | 1.14x |
+| xml | 3.25 | 2.96 | 1.10x | 0.238 | 0.227 | 1.05x |
+| json | 3.21 | 2.92 | 1.10x | 0.229 | 0.217 | 1.06x |
+| log | 3.36 | 3.11 | 1.08x | 0.243 | 0.205 | 1.18x |
+| html | 3.48 | 3.21 | 1.09x | 0.238 | 0.216 | 1.10x |
+| csv | 3.23 | 2.78 | 1.16x | 0.254 | 0.203 | 1.25x |
+| utf8 | 3.01 | 2.79 | 1.08x | 0.227 | 0.203 | 1.12x |
+| b64 | 3.09 | 2.82 | 1.09x | 0.225 | 0.192 | 1.18x |
+| hex | 3.11 | 2.94 | 1.06x | 0.261 | 0.221 | 1.18x |
+| dna | 3.12 | 3.04 | 1.03x | 0.225 | 0.215 | 1.05x |
+| src | 5.74 | 5.14 | 1.12x | 0.316 | 0.282 | 1.12x |
+| floats | 2.49 | 2.01 | 1.24x | 0.302 | 0.260 | 1.16x |
+| pcm | 2.42 | 1.88 | 1.29x | 0.314 | 0.265 | 1.19x |
+| binary | 2.85 | 2.33 | 1.22x | 0.272 | 0.236 | 1.15x |
+| sparse | 2.60 | 2.54 | 1.02x | 0.216 | 0.188 | 1.15x |
+| mixed | 2.85 | 2.41 | 1.18x | 0.262 | 0.202 | 1.30x |
+| rand | 5.23 | 4.04 | 1.29x | 0.004 | 0.004 | 0.92x |
+| **TOTAL** | **70.64** | **63.24** | **1.12x** | **4.903** | **4.245** | **1.16x** |
+
+A second interleaved run of the same pair measured 69.54 -> 60.73 s (1.15x)
+encode and 5.02 -> 4.36 s (1.15x) decode; sandbox timing noise is a few
+percent, so claim ~1.1-1.15x encode and ~1.15-1.25x decode on top of the
+ULTRA engine. Combined with the ULTRA pass this is ~1.55-1.6x over the raw
+v8 engine, still at identical bytes.
+
 ## Notes
 
 - **Ratios vs speed**: G0D SZIP optimizes for size first; gzip/bzip2/xz are
   faster encoders at far worse ratios (see the size table). G0D encode runs
   at ~2.5-12 s per corpus on 2 cores; the ULTRA speed pass made it 1.40x
-  faster than the v8 engine at byte-identical output (sparse 3.5x).
+  faster than the v8 engine at byte-identical output (sparse 3.5x), and the
+  hot-path pass above added ~1.12-1.16x more.
 - **Decode** is single-pass and fast (0.2-0.4 s per corpus here, ~0.3-2 GB/s),
   with multi-block archives decoding blocks in parallel.
 - `rand` is stored in the 4-byte **bare frame** (G0D never expands data;

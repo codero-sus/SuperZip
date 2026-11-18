@@ -399,7 +399,7 @@ struct DPNode {
 #define SZ_ABEAM 8
 #endif
 constexpr uint32_t kDPBeam = SZ_ABEAM;
-constexpr uint32_t kBeamSlots = 32; // allocation stride (>= any beam_cap)
+constexpr uint32_t kBeamSlots = 12; // allocation stride (>= any beam_cap)
 thread_local double plan_cost_estimate = 0;
 
 // lengths whose tokens are evaluated as match edges
@@ -1056,7 +1056,8 @@ void encode_block_szlzrc(const uint8_t *src, uint32_t n,
     SZ_TOC(tp, "passes (single)");
     SZ_TIC(te);
     {
-      const unsigned ew = sz_workers() < 4 ? 2u : 4u;
+      const unsigned ew =
+        std::min(4u, std::max(2u, (unsigned)std::thread::hardware_concurrency()));
       std::vector<std::thread> ths;
       for (unsigned t = 0; t < ew; ++t)
         ths.emplace_back([&, t] {

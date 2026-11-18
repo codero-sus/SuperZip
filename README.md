@@ -174,6 +174,17 @@ Decode is single-pass 0.2-0.4 s and scales with block count. gzip/xz remain
 faster encoders at far worse ratios; G0D SZIP trades encode search for wins
 on 14 of 20 types.
 
+**Speed (the hot-path pass, still byte-identical)**: on top of ULTRA, the
+parse hot loop lost its per-position mixer snapshot/restore (peek is now a
+pure-local walk), beam width dropped 32 -> 12, and the 470 MB mixer trees
+now come from a tiny 2 MB-aligned `MADV_HUGEPAGE` pool with SIMD init —
+the emit wall was DRAM page-walk traffic, not math. Best-of-2 on 2 cores:
+**1.12-1.15x encode and 1.16-1.25x decode** on top of the ULTRA engine
+(pcm 1.29x, rand 1.29x, floats 1.24x encode), ~1.55-1.6x combined over the
+raw v8 engine at identical bytes. Verified: `tests/goldcheck.py` 20/20,
+`build/sztest` all-passed, `tests/beatsniper.sh` 10/1. Tables in
+[BENCHMARKS.md](docs/BENCHMARKS.md).
+
 What remains: **dict** (brotli's static-model niche, −19%), **floats**
 (xz's filters own structured high-entropy binary; the ARF float coder is
 not yet in the block format), and the four sub-3% rows (src, code, binary
