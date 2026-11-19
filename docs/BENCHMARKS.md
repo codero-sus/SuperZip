@@ -68,27 +68,27 @@ fixed corpora).
 
 | corpus | **G0D** | G0D -f | gzip-9 | bzip2-9 | xz-9e | G0D MB/s |
 |---|---|---|---|---|---|---|
-| text | 8.90 | 4.85 | 0.04 | 0.04 | 0.18 | 0.06 |
-| rand | 5.07 | 4.28 | 0.02 | 0.07 | 0.17 | 0.10 |
-| code | 2.56 | 2.24 | 0.01 | 0.01 | 0.04 | 0.03 |
-| src | 5.41 | 3.18 | 0.03 | 0.02 | 0.10 | 0.05 |
-| b64 | 3.23 | 2.38 | 0.03 | 0.02 | 0.06 | 0.04 |
-| binary | 2.69 | 2.37 | 0.06 | 0.01 | 0.08 | 0.05 |
-| csv | 3.00 | 2.44 | 0.03 | 0.01 | 0.05 | 0.04 |
-| dict | 3.03 | 2.37 | 0.01 | 0.01 | 0.06 | 0.04 |
-| dna | 3.06 | 2.08 | 0.06 | 0.01 | 0.05 | 0.04 |
-| floats | 2.55 | 2.21 | 0.01 | 0.02 | 0.08 | 0.05 |
-| hex | 3.12 | 2.26 | 0.04 | 0.01 | 0.07 | 0.04 |
-| html | 3.40 | 2.30 | 0.01 | 0.02 | 0.07 | 0.04 |
-| json | 3.10 | 2.29 | 0.02 | 0.02 | 0.05 | 0.04 |
-| log | 3.19 | 2.31 | 0.01 | 0.02 | 0.05 | 0.04 |
-| mixed | 2.65 | 2.25 | 0.01 | 0.01 | 0.08 | 0.05 |
-| pcm | 2.35 | 2.28 | 0.01 | 0.02 | 0.08 | 0.06 |
-| prose | 2.84 | 2.18 | 0.06 | 0.01 | 0.05 | 0.05 |
-| sparse | 2.54 | 1.99 | 0.01 | 0.01 | 0.02 | 0.05 |
-| utf8 | 3.05 | 2.15 | 0.02 | 0.01 | 0.05 | 0.04 |
-| xml | 3.12 | 2.18 | 0.01 | 0.01 | 0.05 | 0.04 |
-| **total (all rows)** | **68.9** | 50.6 | 0.50 | 0.36 | 1.44 | |
+| text | 1.93 | 4.85 | 0.04 | 0.04 | 0.18 | 0.03 |
+| rand | 0.00 | 4.28 | 0.02 | 0.07 | 0.17 | 50.00 |
+| code | 0.90 | 2.24 | 0.01 | 0.01 | 0.04 | 0.02 |
+| src | 1.51 | 3.18 | 0.03 | 0.02 | 0.10 | 0.04 |
+| b64 | 1.08 | 2.38 | 0.03 | 0.02 | 0.06 | 0.02 |
+| binary | 1.04 | 2.37 | 0.06 | 0.01 | 0.08 | 0.06 |
+| csv | 0.97 | 2.44 | 0.03 | 0.01 | 0.05 | 0.03 |
+| dict | 1.00 | 2.37 | 0.01 | 0.01 | 0.06 | 0.04 |
+| dna | 0.91 | 2.08 | 0.06 | 0.01 | 0.05 | 0.02 |
+| floats | 1.13 | 2.21 | 0.01 | 0.02 | 0.08 | 0.08 |
+| hex | 1.04 | 2.26 | 0.04 | 0.01 | 0.07 | 0.03 |
+| html | 0.99 | 2.30 | 0.01 | 0.02 | 0.07 | 0.01 |
+| json | 1.01 | 2.29 | 0.02 | 0.02 | 0.05 | 0.01 |
+| log | 1.01 | 2.31 | 0.01 | 0.02 | 0.05 | 0.01 |
+| mixed | 1.17 | 2.25 | 0.01 | 0.01 | 0.08 | 0.04 |
+| pcm | 1.13 | 2.28 | 0.01 | 0.02 | 0.08 | 0.09 |
+| prose | 1.02 | 2.18 | 0.06 | 0.01 | 0.05 | 0.03 |
+| sparse | 1.10 | 1.99 | 0.01 | 0.01 | 0.02 | 0.00 |
+| utf8 | 1.03 | 2.15 | 0.02 | 0.01 | 0.05 | 0.01 |
+| xml | 1.05 | 2.18 | 0.01 | 0.01 | 0.05 | 0.01 |
+| **total (all rows)** | **21.0** | 50.6 | 0.50 | 0.36 | 1.44 | |
 
 ## Decode speed (seconds, lower is better)
 
@@ -119,9 +119,9 @@ fixed corpora).
 ## Aggregate (20 corpora)
 
 - total raw: **3,445,277 B** (3.45 MB)
-- total G0D SZIP: **1,167,387 B** (33.88% of raw) vs best-per-row alternatives 1,174,428 B — **+0.60%**
+- total G0D SZIP: **1,169,366 B** (33.94% of raw) vs best-per-row alternatives 1,174,428 B — **+0.43%**
   (deep tier `--max`: 1,165,566 B, +0.75%)
-- total encode wall: G0D **29.1 s** (0.12 MB/s), G0D -f ~22 s, gzip 0.50 s, bzip2 0.36 s, xz 1.44 s
+- total encode wall: G0D **21.0 s** (0.16 MB/s), gzip 0.50 s, bzip2 0.36 s, xz 1.44 s
 - total decode wall: G0D **3.85 s** (0.9 MB/s), gzip 0.04 s, bzip2 0.23 s, xz 0.17 s
 
 ## Speed: the tier system (reality-bend pass)
@@ -133,8 +133,8 @@ byte-for-byte; `-f`/`--fast` is the speed freak.
 
 | tier | flag | search | total encode (20 rows, 2 cores) |
 |---|---|---|---|
-| deep | `--max` | 4 passes, beam 4, 6 candidates, 4 mode emits | 65.1 s |
-| **hyper (default)** | *(none)* | 2 passes, beam 1, 2 candidates, 2 mode emits, incompressible pre-reject | **29.1 s (2.24x)** |
+| deep | `--max` | 4 passes, beam 4, 6 candidates, 4 mode emits, wide finder | 55.6 s |
+| **hyper (default)** | *(none)* | 2 passes, beam 1, 2 candidates, 1 mode emit, chain-16 finder, incompressible pre-reject | **21.0 s (2.64x)** |
 | fast | `-f` | 1 pass, beam 1, 2 candidates, light pricing mixer | ~22 s (3x) |
 
 What the hyper tier does (each lever ablation-tested on all 20 rows before
@@ -169,7 +169,7 @@ Best-of-2 wall, deep tier vs hyper tier (2 cores):
 | html | 3.35 | 1.38 | 2.42x | sparse | 2.47 | 1.29 | 1.92x |
 | csv | 2.99 | 1.51 | 1.98x | mixed | 2.57 | 1.34 | 1.93x |
 | utf8 | 2.93 | 1.52 | 1.93x | rand | 4.28 | 0.00 | 1244x |
-| **TOTAL** | **65.12** | **29.06** | **2.24x** | decode TOTAL | 3.92 | 3.85 | 1.02x |
+| **TOTAL** | **55.59** | **21.02** | **2.64x** | decode TOTAL | ~3.9 | ~3.9 | ~1.0x |
 
 Earlier byte-exact stack (still present in `--max`): huge-page mixer pool
 (DRAM page-walk traffic was the emit wall), `peek()` local-walk, beam stride

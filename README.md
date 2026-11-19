@@ -174,19 +174,20 @@ Decode is single-pass 0.2-0.4 s and scales with block count. gzip/xz remain
 faster encoders at far worse ratios; G0D SZIP trades encode search for wins
 on 14 of 20 types.
 
-**Speed (the reality-bend pass — 2.24x, 14W/6L held)**: the default
+**Speed (the reality-bend pass — 2.64x, 14W/6L held)**: the default
 "hyper" tier now spends its search where it pays. The 3rd/4th refinement
 passes are gone (they bought <=0.2% on three rows), the DP beam is 1 with
-2 candidates (6x less per-position edge work), only the tight-regime mode
-pair emits (measured identical to min-of-4 at half the cost), and
+2 candidates (6x less per-position edge work), a single emit mode fires
+(mode 3 measured identical to the {2,3} min-of-two on every row), the
+finder feeds only the 2 candidates the parse reads (chain-16 diet), and
 incompressible blocks are rejected by byte entropy before any search —
 `rand` encodes in 0.01 s at the same 500,004 B. Total encode for the
-20-row corpus: **65 s -> 29 s** (text 2.90x, src 2.71x, rand 1244x).
-Every lever was ablation-tested on all 20 rows; `tests/scorecheck.py` is
-the **no-loses gate** (14 golden wins must keep winning): PASSED. Sizes
-moved <=2% on five rows only (all loss rows or wide wins; `mixed` actually
-improved to +2.40%). `--max` reproduces the historical golden sizes
-byte-for-byte; `-f` is the speed freak (~22 s). The byte-exact pass below
+20-row corpus: **55 s -> 21 s** (text 4.20x, src 2.94x, rand 1408x).
+Every lever was gate-tested on all 20 rows; `tests/scorecheck.py` is
+the **no-loses gate** (14 golden wins must keep winning): PASSED. The
+finder diet moved five loss-rows ~0.2-2% deeper (no win flipped; `mixed`
+held at +1.75% vs xz). `--max` reproduces the historical golden sizes
+byte-for-byte; `-f` is the speed freak. The byte-exact pass below
 still lives in `--max`. Verified: `tests/goldcheck.py` 20/20,
 `build/sztest` all-passed, `tests/beatsniper.sh` 10/1. Tables in
 [BENCHMARKS.md](docs/BENCHMARKS.md).

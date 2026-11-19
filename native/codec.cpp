@@ -420,7 +420,8 @@ static int g_kmax = 2;   // 0 = default (SZ_PASSES)
 static int g_mcc = 2;    // 0 = default (SZ_MCAND path)
 static int g_prereject = 1;
 static int g_beam_ovr = 1;
-static int g_modeset = 12; // bitmask of emitted modes (tight pair)
+static int g_modeset = 8; // bitmask of emitted modes (mode 3: == {2,3} measured)
+static int g_find_lean = 1; // finder: 2 candidates, chain 16 (wide for --max)
 
 // rank 0 = best candidate (fine lengths); rank > 0 = secondary (coarse).
 static void collect_lens(uint32_t max_len, uint32_t rank,
@@ -514,7 +515,10 @@ static void build_cand_cache(const uint8_t *src, uint32_t n, CandCache &cc) {
       Match tmp[SZ_CANDW];
       for (uint32_t pos = lo; pos < hi; ++pos) {
         const uint32_t k =
-            mf.find_multi_link(src, n, pos, link1.data(), tmp, SZ_CANDW);
+            mf.find_multi_link(src, n, pos, link1.data(), tmp,
+                               g_find_lean ? 2u : (uint32_t)SZ_CANDW,
+                               g_find_lean ? 16u : (uint32_t)SZ_CHAIN,
+                               (uint32_t)SZ_NICE);
         cc.cnt[pos] = (uint8_t)k;
         for (uint32_t i = 0; i < k; ++i) cc.m[(size_t)pos * SZ_CANDW + i] = tmp[i];
       }
@@ -1390,15 +1394,16 @@ void set_parse_tier(const char *tier) {
   if (std::strcmp(tier, "max") == 0) {
     // Byte-exact deep search: the historical engine (golden sizes).
     g_parse_light = 0; g_kmax = 0; g_mcc = 0; g_prereject = 0;
-    g_beam_ovr = 0; g_modeset = 15;
+    g_beam_ovr = 0; g_modeset = 15; g_find_lean = 0;
   } else if (std::strcmp(tier, "fast") == 0) {
     // Speed freak: no refinement pass at all, tiny pricing mixer.
     g_parse_light = 1; g_kmax = 1; g_mcc = 2; g_prereject = 1;
-    g_beam_ovr = 1; g_modeset = 12;
+    g_beam_ovr = 1; g_modeset = 8; g_find_lean = 1;
   } else { // "hyper" — default reality-bend tier
     // Ablation-verified: keeps every win row of the 14W/6L scoreboard.
     g_parse_light = 0; g_kmax = 2; g_mcc = 2; g_prereject = 1;
-    g_beam_ovr = 1; g_modeset = 12; // emit the tight-regime pair only
+    g_beam_ovr = 1; g_modeset = 8; // mode 3 only (measured == {2,3} == min-of-4)
+    g_find_lean = 1;
   }
   // Ablation/debug overrides: SZIP_LIGHT=0/1 SZIP_KMAX=n SZIP_MCC=n
   if (const char *e = std::getenv("SZIP_LIGHT")) g_parse_light = std::atoi(e);

@@ -131,15 +131,20 @@ public:
   // find_multi with the self entry at the head of the chain.
   uint32_t find_multi_link(const uint8_t *data, uint32_t n, uint32_t pos,
                            const uint32_t *link1, Match *out,
-                           uint32_t kmax) const {
+                           uint32_t kmax,
+                           uint32_t chain = SZ_CHAIN,
+                           uint32_t nice = SZ_NICE) const {
     return find_multi_walk(data, n, pos, pos + 1, out, kmax,
-                           [&](uint32_t mpos) { return link1[mpos]; });
+                           [&](uint32_t mpos) { return link1[mpos]; },
+                           chain, nice);
   }
 
   template <class NextFn>
   uint32_t find_multi_walk(const uint8_t *data, uint32_t n, uint32_t pos,
                            uint32_t first, Match *out, uint32_t kmax,
-                           NextFn next_of) const {
+                           NextFn next_of,
+                           uint32_t chain_cap = SZ_CHAIN,
+                           uint32_t nice = SZ_NICE) const {
     if (pos + kMinMatch > n) return 0;
     const uint32_t max_len = std::min<uint32_t>(kMaxMatch, n - pos);
     const uint32_t limit = (pos > kWindow) ? pos - kWindow : 0;
@@ -150,7 +155,7 @@ public:
     uint32_t longest_i = 0, nearest_i = 0;
 
     uint32_t cand = first;
-    for (uint32_t depth = 0; depth < kMaxChain && cand != 0; ++depth) {
+    for (uint32_t depth = 0; depth < chain_cap && cand != 0; ++depth) {
       const uint32_t mpos = cand - 1;
       if (mpos < limit) break;
       if (mpos >= pos) {
@@ -173,7 +178,7 @@ public:
       if (off < all[nearest_i].off) nearest_i = cnt;
       ++cnt;
       if (len == max_len && cnt >= 4) break; // full-length: diversity is done
-      if (len >= kNiceLen && cnt >= kmax) break;
+      if (len >= nice && cnt >= kmax) break;
       cand = next_of(mpos);
     }
     if (cnt == 0) return 0;
