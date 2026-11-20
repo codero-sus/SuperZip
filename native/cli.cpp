@@ -135,6 +135,9 @@ int main(int argc, char **argv) {
           return 2;
         }
         i += 2;
+      } else if (std::strcmp(argv[i], "--sprint") == 0) {
+        szip::set_parse_tier("sprint");
+        i += 1;
       } else if (std::strcmp(argv[i], "--max") == 0) {
         szip::set_parse_tier("max");
         fast = 0;

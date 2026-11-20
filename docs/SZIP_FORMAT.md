@@ -325,6 +325,24 @@ respecting the grammar decodes correctly. The shipped encoder uses
   ships. Both modes (mode byte `0`/`1`) are encoded per block and the smaller
   payload ships there too. The decoder cannot observe any of this.
 
+### 2.5 SZPRINT v2 sprint blocks (`type = 2`)
+
+The speed tier (`--sprint`) writes `type = 2` blocks: an element stream of
+literals and copies (snappy-class tags):
+
+- `tok & 3 == 0` LITERAL: `len-1 = tok >> 2` (1..60 direct; code 60 reads an
+  extension value E and `len = 61 + E`), then `len` raw bytes.  The stream may
+  end after a literal element.
+- `tok & 3 == 1` COPY short: `mlen = ((tok >> 2) & 7) + 4` (4..11),
+  `offset = ((tok >> 5) << 8) | next u8` (1..2047).
+- `tok & 3 == 2` COPY wide: `mlen = (tok >> 2) + 4` (4..66; code 63 reads an
+  extension E and `mlen = 67 + E`), `offset = u16 LE` (1..65535).
+- `tok & 3 == 3` reserved (corrupt).
+
+Extension value E: one byte if `E < 255`, else `255` sentinel + u16 LE `E-255`.
+Copies use memmove semantics (`dst[i] = dst[i-offset]`).  The stream must not
+end mid-element and must decompress to exactly `raw_size`.
+
 ### 2.6 Stored blocks (`type = 0`)
 
 Raw bytes verbatim. The encoder picks stored whenever the compressed payload

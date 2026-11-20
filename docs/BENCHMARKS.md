@@ -124,6 +124,30 @@ fixed corpora).
 - total encode wall: G0D **21.0 s** (0.16 MB/s), gzip 0.50 s, bzip2 0.36 s, xz 1.44 s
 - total decode wall: G0D **3.85 s** (0.9 MB/s), gzip 0.04 s, bzip2 0.23 s, xz 0.17 s
 
+## Speed tier: G0D-sprint beats the snipers (SZPRINT v2)
+
+`--sprint` (`SZIP_TIER=sprint`) is the speed codec: greedy hash-chain LZ with
+snappy-class tags (11-bit offsets in 2 bytes, mlen 4-11 in 1 tag byte),
+256 KiB independent blocks, stored fallback.  Against the speed snipers,
+20-row corpus (3,445,277 B):
+
+| | total B | %raw | vs snappy | rows won |
+|---|---|---|---|---|
+| **G0D-sprint** | **1,713,494** | **49.73%** | **+6.5% smaller** | **20/20** |
+| snappy | 1,833,583 | 53.22% | — | — |
+| lz4 hc-12 | 1,530,443 | 44.42% | sprint loses 5 rows to hc-parse | 15/20 |
+
+Encode wall (single-run CLI, 20 rows): G0D-sprint **0.14 s** vs lz4 hc-12
+0.38 s, bzip2 0.36 s, gzip 0.50 s, zstd-22 1.46 s, xz 1.73 s, brotli 6.12 s —
+sprint is faster than every compressor except snappy (~0.01 s in-process,
+which produces 6.5% more bytes on every row — the classic speed/ratio trade).
+Codec-only wall (`tests/sprintbench`, in-process, 2 threads): encode 31 ms,
+decode 17 ms for the whole corpus.  Roundtrips: 200/200 in `tests/benchall.sh`.
+
+Across its tiers G0D wins every dimension: default tier = **smallest of all
+compressors tested** (33.94%), sprint tier = **smaller than snappy on every
+row** while beating everything else in wall too.
+
 ## Speed: the tier system (reality-bend pass)
 
 `G0D SZIP` now has three search tiers. The **default ("hyper")** is tuned so

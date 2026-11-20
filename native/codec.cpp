@@ -19,6 +19,9 @@
 #include "crc32.hpp"
 #include "lz77.hpp"
 #include "mix.hpp"
+#include <condition_variable>
+#include <functional>
+#include "sprint.hpp"
 #ifndef SZ_MATCHBIAS
 #define SZ_MATCHBIAS 16
 #endif
@@ -422,6 +425,7 @@ static int g_prereject = 1;
 static int g_beam_ovr = 1;
 static int g_modeset = 8; // bitmask of emitted modes (mode 3: == {2,3} measured)
 static int g_find_lean = 1; // finder: 2 candidates, chain 16 (wide for --max)
+static int g_sprint = 0; // SZPRINT speed tier (snappy/lz4-killer path)
 
 // rank 0 = best candidate (fine lengths); rank > 0 = secondary (coarse).
 static void collect_lens(uint32_t max_len, uint32_t rank,
@@ -484,6 +488,74 @@ static unsigned sz_workers() {
   unsigned hw = std::thread::hardware_concurrency();
   if (hw == 0) hw = 2;
   return hw < 2 ? 1u : (hw > 8 ? 8u : hw);
+}
+
+// Persistent worker pool: std::thread spawn costs ~300 us on small VMs, which
+// dominated per-batch encoding.  One pool lives for the process; parallel_for
+// fans out fn(0..count-1) across the workers and returns when all finish.
+static std::mutex g_pmu;
+static std::condition_variable g_pgo, g_pdone;
+static std::function<void(uint32_t)> g_pfn;
+static uint32_t g_pcount = 0, g_pfinished = 0, g_pgen = 0, g_pworkers = 0;
+static bool g_pstop = false;
+static std::vector<std::thread> g_pool;
+
+static void pool_worker(uint32_t wid) {
+  uint32_t seen = 0;
+  for (;;) {
+    {
+      std::unique_lock<std::mutex> lk(g_pmu);
+      g_pgo.wait(lk, [&] { return g_pstop || g_pgen != seen; });
+      if (g_pstop) return;
+      seen = g_pgen;
+    }
+    for (uint32_t i = wid; i < g_pcount; i += g_pworkers) g_pfn(i);
+    {
+      std::lock_guard<std::mutex> lk(g_pmu);
+      if (++g_pfinished == g_pworkers) g_pdone.notify_one();
+    }
+  }
+}
+
+static void pool_shutdown() {
+  {
+    std::lock_guard<std::mutex> lk(g_pmu);
+    g_pstop = true;
+    g_pgo.notify_all();
+  }
+  for (auto &t : g_pool)
+    if (t.joinable()) t.join();
+}
+
+static void pool_ensure() {
+  std::lock_guard<std::mutex> lk(g_pmu);
+  if (!g_pool.empty()) return;
+  g_pworkers = sz_workers();
+  for (uint32_t w = 0; w < g_pworkers; ++w)
+    g_pool.emplace_back(pool_worker, w);
+  std::atexit(pool_shutdown);
+}
+
+static void parallel_for(uint32_t count,
+                         const std::function<void(uint32_t)> &fn) {
+  if (count == 0) return;
+  if (count == 1) {
+    fn(0);
+    return;
+  }
+  pool_ensure();
+  {
+    std::lock_guard<std::mutex> lk(g_pmu);
+    g_pfn = fn;
+    g_pcount = count;
+    g_pfinished = 0;
+    ++g_pgen;
+    g_pgo.notify_all();
+  }
+  {
+    std::unique_lock<std::mutex> lk(g_pmu);
+    g_pdone.wait(lk, [] { return g_pfinished == g_pworkers; });
+  }
 }
 
 static void build_cand_cache(const uint8_t *src, uint32_t n, CandCache &cc) {
@@ -1391,6 +1463,11 @@ void set_parse_fast(int fast) { g_parse_fast = fast < 0 ? 0 : fast; }
 
 void set_parse_tier(const char *tier) {
   if (!tier || !*tier) return;
+  if (std::strcmp(tier, "sprint") == 0) {
+    g_sprint = 1;
+    return;
+  }
+  g_sprint = 0;
   if (std::strcmp(tier, "max") == 0) {
     // Byte-exact deep search: the historical engine (golden sizes).
     g_parse_light = 0; g_kmax = 0; g_mcc = 0; g_prereject = 0;
@@ -1414,8 +1491,20 @@ void set_parse_tier(const char *tier) {
   if (const char *e = std::getenv("SZIP_MODES")) g_modeset = (1 << std::atoi(e)) - 1;
 }
 
+static void encode_block_auto(const uint8_t *src, uint32_t n,
+                              std::vector<uint8_t> &payload, uint8_t &type) {
+  if (g_sprint) {
+    sprint::compress(src, n, payload);
+    type = SZIP_BLOCK_SPRINT;
+  } else {
+    encode_block_szlzrc(src, n, payload);
+    type = SZIP_BLOCK_SZLZRC;
+  }
+}
+
 int compress_file(const std::string &in_path, const std::string &out_path,
                   uint32_t block_size) {
+  if (g_sprint && block_size > (256u << 10)) block_size = 256u << 10;
   if (block_size == 0 || block_size > (1u << 24)) return SZIP_ERR_FORMAT;
 
   std::ifstream is(in_path, std::ios::binary);
@@ -1436,7 +1525,8 @@ int compress_file(const std::string &in_path, const std::string &out_path,
         !is.read(reinterpret_cast<char *>(raw.data()), (std::streamsize)total))
       return SZIP_ERR_IO;
     std::vector<uint8_t> payload;
-    encode_block_szlzrc(raw.data(), static_cast<uint32_t>(total), payload);
+    uint8_t btype = SZIP_BLOCK_SZLZRC;
+    encode_block_auto(raw.data(), static_cast<uint32_t>(total), payload, btype);
     // Bare frame wins unless compression saves at least the 15-byte compact
     // overhead (bare file = raw + 4).
     if (payload.size() + 11 >= (size_t)total) {
@@ -1449,7 +1539,7 @@ int compress_file(const std::string &in_path, const std::string &out_path,
       return os ? SZIP_OK : SZIP_ERR_IO;
     }
     write_compact_magic(os);
-    write_compact_block(os, SZIP_BLOCK_SZLZRC,
+    write_compact_block(os, btype,
                         static_cast<uint32_t>(total),
                         static_cast<uint32_t>(payload.size()));
     os.write(reinterpret_cast<const char *>(payload.data()),
@@ -1478,18 +1568,16 @@ int compress_file(const std::string &in_path, const std::string &out_path,
         return SZIP_ERR_IO;
       remaining -= wants[b];
     }
-    std::vector<std::thread> ths;
-    for (unsigned b = 0; b < batch; ++b)
-      ths.emplace_back([&, b] {
-        encode_block_szlzrc(raws[b].data(), wants[b], pays[b]);
-      });
-    for (auto &t : ths) t.join();
+    std::vector<uint8_t> ptype(nw, SZIP_BLOCK_SZLZRC);
+    parallel_for(batch, [&](uint32_t b) {
+      encode_block_auto(raws[b].data(), wants[b], pays[b], ptype[b]);
+    });
     for (unsigned b = 0; b < batch; ++b) {
       crc = szip_crc32_update(crc, raws[b].data(), wants[b]);
       const bool store = pays[b].size() >= wants[b];
       const uint32_t comp_size =
           store ? wants[b] : static_cast<uint32_t>(pays[b].size());
-      write_compact_block(os, store ? SZIP_BLOCK_STORED : SZIP_BLOCK_SZLZRC,
+      write_compact_block(os, store ? SZIP_BLOCK_STORED : ptype[b],
                           wants[b], comp_size);
       if (store)
         os.write(reinterpret_cast<const char *>(raws[b].data()), wants[b]);
@@ -1507,11 +1595,13 @@ int compress_file(const std::string &in_path, const std::string &out_path,
 int compress_buffer(const uint8_t *data, size_t len,
                     std::vector<uint8_t> &out, uint32_t block_size) {
   if (block_size == 0 || block_size > (1u << 24)) return SZIP_ERR_FORMAT;
+  if (g_sprint && block_size > (256u << 10)) block_size = 256u << 10;
   if (len > (size_t)1 << 32) return SZIP_ERR_FORMAT;
   std::vector<uint8_t> payload;
   // Single-block bare/normal fast path (mirrors compress_file).
   if (len <= block_size) {
-    encode_block_szlzrc(data, static_cast<uint32_t>(len), payload);
+    uint8_t btype = SZIP_BLOCK_SZLZRC;
+    encode_block_auto(data, static_cast<uint32_t>(len), payload, btype);
     if (payload.size() + 11 >= len) {
       out.resize(4 + len);
       out[0] = SZIP_MAGIC0; out[1] = SZIP_MAGIC1; out[2] = SZIP_MAGIC2;
@@ -1521,7 +1611,7 @@ int compress_buffer(const uint8_t *data, size_t len,
     }
     std::ostringstream os(std::ios::binary);
     write_compact_magic(os);
-    write_compact_block(os, SZIP_BLOCK_SZLZRC, (uint32_t)len,
+    write_compact_block(os, btype, (uint32_t)len,
                         (uint32_t)payload.size());
     os.write((const char *)payload.data(), (std::streamsize)payload.size());
     put_u32(os, szip_crc32(data, len));
@@ -1546,18 +1636,16 @@ int compress_buffer(const uint8_t *data, size_t len,
           std::min<size_t>(block_size, len - off));
       off += wants[b];
     }
-    std::vector<std::thread> ths;
-    for (unsigned b = 0; b < batch; ++b)
-      ths.emplace_back([&, b] {
-        encode_block_szlzrc(blks[b], wants[b], pays[b]);
-      });
-    for (auto &t : ths) t.join();
+    std::vector<uint8_t> ptype(nw, SZIP_BLOCK_SZLZRC);
+    parallel_for(batch, [&](uint32_t b) {
+      encode_block_auto(blks[b], wants[b], pays[b], ptype[b]);
+    });
     for (unsigned b = 0; b < batch; ++b) {
       crc = szip_crc32_update(crc, blks[b], wants[b]);
       const bool store = pays[b].size() >= wants[b];
       const uint32_t comp_size =
           store ? wants[b] : static_cast<uint32_t>(pays[b].size());
-      write_compact_block(os, store ? SZIP_BLOCK_STORED : SZIP_BLOCK_SZLZRC,
+      write_compact_block(os, store ? SZIP_BLOCK_STORED : ptype[b],
                           wants[b], comp_size);
       if (store) os.write((const char *)blks[b], wants[b]);
       else os.write((const char *)pays[b].data(), comp_size);
@@ -1607,6 +1695,8 @@ int walk_blocks_v7(std::istream &is, uint64_t stream_len,
         if (b.comp_size != b.raw_size) return SZIP_ERR_CORRUPT;
       } else if (b.type == SZIP_BLOCK_SZLZRC) {
         if (b.comp_size < 5) return SZIP_ERR_CORRUPT;
+      } else if (b.type == SZIP_BLOCK_SPRINT) {
+        if (b.comp_size < 1) return SZIP_ERR_CORRUPT;
       } else {
         return SZIP_ERR_UNSUPPORTED;
       }
@@ -1623,9 +1713,16 @@ int walk_blocks_v7(std::istream &is, uint64_t stream_len,
       if (group[gi].type == SZIP_BLOCK_STORED) continue;
       ths.emplace_back([&, gi] {
         raws[gi].resize(group[gi].raw_size);
-        errs[gi] = decode_block_szlzrc(group[gi].payload.data(),
-                                       group[gi].comp_size, raws[gi].data(),
-                                       group[gi].raw_size);
+        if (group[gi].type == SZIP_BLOCK_SPRINT)
+          errs[gi] = sprint::decompress(group[gi].payload.data(),
+                                        group[gi].comp_size, raws[gi].data(),
+                                        group[gi].raw_size) == 0
+                         ? SZIP_OK
+                         : SZIP_ERR_CORRUPT;
+        else
+          errs[gi] = decode_block_szlzrc(group[gi].payload.data(),
+                                         group[gi].comp_size, raws[gi].data(),
+                                         group[gi].raw_size);
       });
     }
     for (auto &t : ths) t.join();
@@ -1926,6 +2023,36 @@ int szip_decompress_block(const uint8_t *src, size_t src_len, uint8_t *dst,
   if (raw_len > (1u << 24)) return SZIP_ERR_FORMAT;
   return szip::decode_block_szlzrc(src, src_len, dst,
                                    static_cast<uint32_t>(raw_len));
+}
+
+int szip_compress_block_sprint(const uint8_t *src, size_t src_len, uint8_t *dst,
+                               size_t dst_cap, size_t *dst_len) {
+  if (!dst_len) return SZIP_ERR_FORMAT;
+  if (src_len == 0) {
+    *dst_len = 0;
+    return SZIP_OK;
+  }
+  if (src_len > (1u << 24)) return SZIP_ERR_FORMAT;
+  try {
+    std::vector<uint8_t> payload;
+    szip::sprint::compress(src, static_cast<uint32_t>(src_len), payload);
+    if (payload.size() > dst_cap) return SZIP_ERR_BUFFER;
+    std::memcpy(dst, payload.data(), payload.size());
+    *dst_len = payload.size();
+    return SZIP_OK;
+  } catch (...) {
+    return SZIP_ERR_NOMEM;
+  }
+}
+
+int szip_decompress_block_sprint(const uint8_t *src, size_t src_len,
+                                 uint8_t *dst, size_t raw_len) {
+  if (raw_len == 0) return SZIP_OK;
+  if (raw_len > (1u << 24)) return SZIP_ERR_FORMAT;
+  return szip::sprint::decompress(src, static_cast<uint32_t>(src_len), dst,
+                                  static_cast<uint32_t>(raw_len)) == 0
+             ? SZIP_OK
+             : SZIP_ERR_CORRUPT;
 }
 
 uint32_t szip_crc32_update(uint32_t crc, const uint8_t *data, size_t len) {

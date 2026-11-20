@@ -35,6 +35,7 @@ extern "C" {
 #define SZIP_BLOCK_HEADER_SIZE 10
 #define SZIP_BLOCK_STORED 0
 #define SZIP_BLOCK_SZLZRC 1
+#define SZIP_BLOCK_SPRINT 2 /* SZPRINT v1: sprint LZ (speed tier) */
 #define SZIP_DEFAULT_BLOCK_SIZE (1u << 20)
 
 /* Codec limits (SZLZRC v1). */
@@ -57,6 +58,12 @@ int szip_compress_block(const uint8_t *src, size_t src_len, uint8_t *dst,
  * block header. Returns SZIP_OK, or a negative error for corrupt input. */
 int szip_decompress_block(const uint8_t *src, size_t src_len, uint8_t *dst,
                           size_t raw_len);
+
+/* SZPRINT v1 sprint codec block API (G0D-sprint speed tier). */
+int szip_compress_block_sprint(const uint8_t *src, size_t src_len, uint8_t *dst,
+                               size_t dst_cap, size_t *dst_len);
+int szip_decompress_block_sprint(const uint8_t *src, size_t src_len,
+                                 uint8_t *dst, size_t raw_len);
 
 /* IEEE CRC-32 (poly 0xEDB88320). */
 uint32_t szip_crc32(const uint8_t *data, size_t len);

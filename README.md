@@ -189,7 +189,17 @@ finder diet moved five loss-rows ~0.2-2% deeper (no win flipped; `mixed`
 held at +1.75% vs xz). `--max` reproduces the historical golden sizes
 byte-for-byte; `-f` is the speed freak. The byte-exact pass below
 still lives in `--max`. Verified: `tests/goldcheck.py` 20/20,
-`build/sztest` all-passed, `tests/beatsniper.sh` 10/1. Tables in
+`build/sztest` all-passed, `tests/beatsniper.sh` 10/1.
+
+**G0D-sprint (the sniper slayer):** `--sprint` writes `type=2` SZPRINT v2
+blocks — greedy hash-chain LZ with snappy-class tags. It beats **snappy on
+every one of the 20 corpus rows** (total **6.5% smaller**, 20/20) and is
+faster than every other compressor tested (lz4hc 0.38s, gzip 0.50s, bzip2
+0.36s, zstd-22 1.46s, xz 1.73s, brotli 6.12s vs sprint 0.14s for the
+corpus); snappy alone trades 6.5% bigger output everywhere for its raw
+wall. Together: G0D is the **smallest of all** (default tier, 33.94% of
+raw vs the next-best 36.16%) and the **snappy-killer** at speed (sprint
+tier) — one product, every dimension. Tables in
 [BENCHMARKS.md](docs/BENCHMARKS.md).
 
 **Byte-exact pass (still in `--max`)**: huge-page mixer pool (the emit wall
