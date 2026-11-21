@@ -3,6 +3,95 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
+#include <vector>
+#include <mutex>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <new>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
+// ---- speed: tree init dominates encoder "emit" wall (470 MB per MixLit).
+// (1) SIMD fill for the u16 init pattern (libstdc++ std::fill is scalar),
+// (2) thread-local block pool so repeated construct/destruct cycles reuse
+//     warm pages instead of re-mapping 470 MB every time.  Exact: the bytes
+//     written are identical to assign(n, kProbInit).
+inline void szip_fill16(uint16_t *p, size_t n, uint16_t v) {
+#if defined(__SSE2__)
+  __m128i pat = _mm_set1_epi16((short)v);
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8) _mm_storeu_si128((__m128i *)(p + i), pat);
+  std::fill(p + i, p + n, v);
+#else
+  std::fill(p, p + n, v);
+#endif
+}
+
+namespace poolalloc_detail {
+struct Blk { void *p; size_t bytes; };
+// One GLOBAL warm cache (mutex-guarded, hard cap ~512 MB): emit threads
+// cycle construct/destruct sequentially, so a single recycled block per
+// size class removes the re-fault cost without ballooning a 3.9 GB VM.
+inline std::vector<Blk> &pool() {
+  static std::vector<Blk> p;
+  return p;
+}
+inline std::mutex &pmutex() {
+  static std::mutex m;
+  return m;
+}
+} // namespace poolalloc_detail
+
+template <class T> struct PoolAlloc {
+  using value_type = T;
+  PoolAlloc() = default;
+  template <class U> PoolAlloc(const PoolAlloc<U> &) {}
+  T *allocate(size_t n) {
+    const size_t kHP = (size_t)2u << 20;
+    const size_t bytes = (n * sizeof(T) + kHP - 1) & ~(kHP - 1);
+    {
+      std::lock_guard<std::mutex> lk(poolalloc_detail::pmutex());
+      auto &pool = poolalloc_detail::pool();
+      for (size_t i = 0; i < pool.size(); ++i) {
+        if (pool[i].bytes == bytes) {
+          T *p = (T *)pool[i].p;
+          pool[i] = pool.back();
+          pool.pop_back();
+          return p;
+        }
+      }
+    }
+    void *p = nullptr;
+    if (posix_memalign(&p, kHP, bytes) != 0 || !p) {
+      p = std::malloc(n * sizeof(T));
+      if (!p) throw std::bad_alloc();
+      return (T *)p;
+    }
+#if defined(MADV_HUGEPAGE)
+    madvise(p, bytes, MADV_HUGEPAGE);
+#endif
+    return (T *)p;
+  }
+  void deallocate(T *p, size_t n) noexcept {
+    const size_t kHP = (size_t)2u << 20;
+    const size_t bytes = (n * sizeof(T) + kHP - 1) & ~(kHP - 1);
+    std::lock_guard<std::mutex> lk(poolalloc_detail::pmutex());
+    auto &pool = poolalloc_detail::pool();
+    size_t total = 0;
+    for (auto &b : pool) total += b.bytes;
+    if (pool.size() < 2 && total + bytes <= (size_t)512u << 20) {
+      pool.push_back({p, bytes});
+      return;
+    }
+    std::free(p);
+  }
+};
+template <class T, class U>
+bool operator==(const PoolAlloc<T> &, const PoolAlloc<U> &) { return true; }
+template <class T, class U>
+bool operator!=(const PoolAlloc<T> &, const PoolAlloc<U> &) { return false; }
 #include <vector>
 
 #include "rc.hpp"
@@ -116,23 +205,35 @@ constexpr uint32_t kWCtx = SZ_WSTATE ? 256u : (uint32_t)SZ_WCTX;
 #endif
 
 struct MixLit {
-  std::vector<Prob> t[6];
+  std::vector<Prob, PoolAlloc<Prob>> t[6];
   int32_t w[kWCtx][6];
   uint32_t gap_mode = 0;
   int32_t ts_ = SZ_TREESHIFT;
   int32_t wsh_ = SZ_WSHIFT;
   int32_t esh_ = SZ_ERRSHIFT;
+  // "light" pricing mixer: same model shape, cache-resident tree sizes.
+  // Used by the DP pricer only — the emitter/decoder keep the full mixer,
+  // so light-mode pricing changes search decisions, never the format.
+  bool light_ = false;
+  uint32_t m1_ = 65535, m2_ = (1u << SZ_O3BITS) - 1, m3_ = (1u << SZ_O4BITS) - 1,
+           m4_ = (1u << SZ_O5BITS) - 1, m5_ = 65535;
 
-  explicit MixLit(uint32_t mode = 0) : gap_mode(mode) {
+  explicit MixLit(uint32_t mode = 0, bool light = false) : gap_mode(mode), light_(light) {
     ts_ = gap_mode ? SZ_TREESHIFT_B : SZ_TREESHIFT;
     wsh_ = gap_mode ? SZ_WSHIFT_B : SZ_WSHIFT;
     esh_ = gap_mode ? SZ_ERRSHIFT_B : SZ_ERRSHIFT;
-    t[0].assign((SZ_STATE ? 96u : 32u) * 256, static_cast<Prob>(kProbInit));
-    t[1].assign((SZ_O1EXACT ? 65536u : 8192u) * 256, static_cast<Prob>(kProbInit));
-    t[2].assign((1u << SZ_O3BITS) * 256, static_cast<Prob>(kProbInit));
-    t[3].assign((1u << SZ_O4BITS) * 256, static_cast<Prob>(kProbInit));
-    if (SZ_ORDER5) t[4].assign((1u << SZ_O5BITS) * 256, static_cast<Prob>(kProbInit));
-    t[5].assign(65536 * 256, static_cast<Prob>(kProbInit)); // (wpos, prev, pprev>>3) word shape
+    uint32_t r1 = SZ_O1EXACT ? 65536u : 8192u, r2 = 1u << SZ_O3BITS,
+             r3 = 1u << SZ_O4BITS, r4 = 1u << SZ_O5BITS, r5 = 65536u;
+    if (light_) { // ~24 MB total: fits L3 on real boxes, kills page walks
+      r1 = 4096; r2 = 1u << 14; r3 = 1u << 14; r4 = 0; r5 = 8192;
+    }
+    m1_ = r1 - 1; m2_ = r2 - 1; m3_ = r3 - 1; m4_ = r4 ? r4 - 1 : 0; m5_ = r5 - 1;
+    { const size_t nn = (size_t)((SZ_STATE ? 96u : 32u) * 256); t[0].resize(nn); szip_fill16(t[0].data(), nn, (uint16_t)kProbInit); }
+    { const size_t nn = (size_t)r1 * 256; t[1].resize(nn); szip_fill16(t[1].data(), nn, (uint16_t)kProbInit); }
+    { const size_t nn = (size_t)r2 * 256; t[2].resize(nn); szip_fill16(t[2].data(), nn, (uint16_t)kProbInit); }
+    { const size_t nn = (size_t)r3 * 256; t[3].resize(nn); szip_fill16(t[3].data(), nn, (uint16_t)kProbInit); }
+    if (SZ_ORDER5 && r4) { const size_t nn = (size_t)r4 * 256; t[4].resize(nn); szip_fill16(t[4].data(), nn, (uint16_t)kProbInit); }
+    { const size_t nn = (size_t)r5 * 256; t[5].resize(nn); szip_fill16(t[5].data(), nn, (uint16_t)kProbInit); } // (wpos, prev, pprev>>3) word shape
     for (auto &row : w)
       for (auto &x : row) x = (1 << kWShift) / 6; // start as equal mix
   }
@@ -242,10 +343,10 @@ struct MixLit {
     uint32_t sym = 1;
     for (int k = 7; k >= 0; --k) {
       const uint32_t bit = (b >> k) & 1;
-      Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][c1 * 256 + sym];
-      Prob *n2 = &t[2][c2 * 256 + sym], *n3 = &t[3][c3 * 256 + sym];
-      Prob *n4 = (SZ_ORDER5 && !(gap_mode && SZ_NO5_B)) ? &t[4][c5 * 256 + sym] : nullptr;
-      Prob *n5 = &t[5][cw * 256 + sym];
+      Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][(c1 & m1_) * 256 + sym];
+      Prob *n2 = &t[2][(c2 & m2_) * 256 + sym], *n3 = &t[3][(c3 & m3_) * 256 + sym];
+      Prob *n4 = (SZ_ORDER5 && !light_ && !(gap_mode && SZ_NO5_B)) ? &t[4][(c5 & m4_) * 256 + sym] : nullptr;
+      Prob *n5 = &t[5][(cw & m5_) * 256 + sym];
       const uint32_t wk = wctx((uint32_t)(7 - k), h, st);
       const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5);
       train(wk, n0, n1, n2, n3, n4, n5, bit, p);
@@ -264,10 +365,10 @@ struct MixLit {
     uint32_t sym = 1;
     for (int k = 7; k >= 0; --k) {
       const uint32_t bit = (b >> k) & 1;
-      Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][c1 * 256 + sym];
-      Prob *n2 = &t[2][c2 * 256 + sym], *n3 = &t[3][c3 * 256 + sym];
-      Prob *n4 = (SZ_ORDER5 && !(gap_mode && SZ_NO5_B)) ? &t[4][c5 * 256 + sym] : nullptr;
-      Prob *n5 = &t[5][cw * 256 + sym];
+      Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][(c1 & m1_) * 256 + sym];
+      Prob *n2 = &t[2][(c2 & m2_) * 256 + sym], *n3 = &t[3][(c3 & m3_) * 256 + sym];
+      Prob *n4 = (SZ_ORDER5 && !light_ && !(gap_mode && SZ_NO5_B)) ? &t[4][(c5 & m4_) * 256 + sym] : nullptr;
+      Prob *n5 = &t[5][(cw & m5_) * 256 + sym];
       const uint32_t wk = wctx((uint32_t)(7 - k), h, st);
       const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5);
 #if SZ_STATS
@@ -289,10 +390,10 @@ struct MixLit {
     const uint32_t cw = hw(h, mb);
     uint32_t sym = 1;
     for (int k = 0; k < 8; ++k) {
-      Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][c1 * 256 + sym];
-      Prob *n2 = &t[2][c2 * 256 + sym], *n3 = &t[3][c3 * 256 + sym];
-      Prob *n4 = (SZ_ORDER5 && !(gap_mode && SZ_NO5_B)) ? &t[4][c5 * 256 + sym] : nullptr;
-      Prob *n5 = &t[5][cw * 256 + sym];
+      Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][(c1 & m1_) * 256 + sym];
+      Prob *n2 = &t[2][(c2 & m2_) * 256 + sym], *n3 = &t[3][(c3 & m3_) * 256 + sym];
+      Prob *n4 = (SZ_ORDER5 && !light_ && !(gap_mode && SZ_NO5_B)) ? &t[4][(c5 & m4_) * 256 + sym] : nullptr;
+      Prob *n5 = &t[5][(cw & m5_) * 256 + sym];
       const uint32_t wk = wctx((uint32_t)k, h, st);
       const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5);
       const uint32_t bit = rc.decode_bit_p(p);
@@ -303,8 +404,10 @@ struct MixLit {
   }
 
   // Exact cost in 1/16 bits of coding `b` from history `h`. Mirrors encode()
-  // bit-for-bit (intra-byte adaptation included) via a shadow training walk,
-  // then restores all touched state.
+  // bit-for-bit (intra-byte adaptation included).  The 8 bit-steps touch 8
+  // distinct nodes per table (unique sym path) and 8 distinct weight rows
+  // (bitpos 0..7), so the adaptation walk runs entirely on local copies:
+  // no state is mutated and nothing needs snapshot/restore.
   uint32_t peek(const Hist &h, uint8_t b, uint8_t mb, uint8_t st) {
     const uint32_t c0 = h1(h.b[0]) + (SZ_STATE ? 32u * st : 0u);
     const uint32_t c1 = h2(h.b[0], h.b[1], h.wpos, mb, st, h.bns);
@@ -313,46 +416,63 @@ struct MixLit {
     const uint32_t c5 = SZ_ORDER5 ? h5(h.b[0], h.b[1], h.b[2], h.b[3], h.b[4], h.wpos) : 0;
     const uint32_t cw = hw(h, mb);
 
-    // snapshot the exact state this byte will touch (8 steps x 6 models)
-    Prob *nodes[8][6];
-    Prob saved_n[8][6];
+    Prob n[8][6];
+    int32_t wl[8][6];
     uint32_t wks[8];
-    int32_t saved_w[8][6];
     uint32_t sym = 1;
     for (int k = 7; k >= 0; --k) {
       const int step = 7 - k;
-      nodes[step][0] = &t[0][c0 * 256 + sym];
-      nodes[step][1] = &t[1][c1 * 256 + sym];
-      nodes[step][2] = &t[2][c2 * 256 + sym];
-      nodes[step][3] = &t[3][c3 * 256 + sym];
-      nodes[step][4] = (SZ_ORDER5 && !(gap_mode && SZ_NO5_B)) ? &t[4][c5 * 256 + sym] : nullptr;
-      nodes[step][5] = &t[5][cw * 256 + sym];
-      for (int j = 0; j < 6; ++j) saved_n[step][j] = nodes[step][j] ? *nodes[step][j] : 0;
-      const uint32_t wk = wctx((uint32_t)(7 - k), h, st);
-      wks[step] = wk;
-      for (int j = 0; j < 6; ++j) saved_w[step][j] = w[wk][j];
+      const Prob *srcs[6] = {
+          &t[0][c0 * 256 + sym], &t[1][(c1 & m1_) * 256 + sym],
+          &t[2][(c2 & m2_) * 256 + sym], &t[3][(c3 & m3_) * 256 + sym],
+          (SZ_ORDER5 && !light_ && !(gap_mode && SZ_NO5_B)) ? &t[4][(c5 & m4_) * 256 + sym]
+                                                 : nullptr,
+          &t[5][(cw & m5_) * 256 + sym]};
+      for (int j = 0; j < 6; ++j) n[step][j] = srcs[j] ? *srcs[j] : (Prob)0;
+      wks[step] = wctx((uint32_t)(7 - k), h, st);
+      for (int j = 0; j < 6; ++j) wl[step][j] = w[wks[step]][j];
       sym = (sym << 1) | ((b >> k) & 1u);
     }
 
-    // shadow walk: identical to encode()'s updates, accumulating price
-    sym = 1;
     uint32_t price = 0;
     for (int k = 7; k >= 0; --k) {
+      const int step = 7 - k;
       const uint32_t bit = (b >> k) & 1;
-      const uint32_t wk = wctx((uint32_t)(7 - k), h, st);
-      Prob *n0 = nodes[7 - k][0], *n1 = nodes[7 - k][1], *n2 = nodes[7 - k][2];
-      Prob *n3 = nodes[7 - k][3], *n4 = nodes[7 - k][4], *n5 = nodes[7 - k][5];
-      const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5);
+      Prob *n0 = &n[step][0], *n1 = &n[step][1], *n2 = &n[step][2];
+      Prob *n3 = &n[step][3], *n4 = &n[step][4], *n5 = &n[step][5];
+      const int32_t x0 = kStretch[*n0], x1 = kStretch[*n1];
+      const int32_t x2 = kStretch[*n2], x3 = kStretch[*n3];
+      const int32_t x4 = n4 ? kStretch[*n4] : 0;
+      const int32_t x5 = kStretch[*n5];
+      int32_t x = (int32_t)((wl[step][0] * (int64_t)x0 + wl[step][1] * (int64_t)x1 +
+                             wl[step][2] * (int64_t)x2 + wl[step][3] * (int64_t)x3 +
+                             wl[step][4] * (int64_t)x4 + wl[step][5] * (int64_t)x5) >>
+                            kWShift);
+      if (x > SZIP_SQUASH_BIAS) x = SZIP_SQUASH_BIAS;
+      if (x < -SZIP_SQUASH_BIAS) x = -SZIP_SQUASH_BIAS;
+      const uint32_t p = (uint32_t)kSquash[(x + SZIP_SQUASH_BIAS) >> SZIP_SQUASH_SHIFT];
       price += kBitPrice[bit == 0 ? p : 2048 - p];
-      train(wk, n0, n1, n2, n3, n4, n5, bit, p);
-      sym = (sym << 1) | bit;
-    }
-
-    // restore
-    for (int step = 0; step < 8; ++step) {
-      for (int j = 0; j < 6; ++j)
-        if (nodes[step][j]) *nodes[step][j] = saved_n[step][j];
-      for (int j = 0; j < 6; ++j) w[wks[step]][j] = saved_w[step][j];
+      // train the local copies exactly like train() does
+      if (bit == 0) {
+        for (int j = 0; j < 6; ++j)
+          if (j != 4 || n4)
+            n[step][j] = (Prob)(n[step][j] + ((2048 - n[step][j]) >> ts_));
+      } else {
+        for (int j = 0; j < 6; ++j)
+          if (j != 4 || n4)
+            n[step][j] = (Prob)(n[step][j] - (n[step][j] >> ts_));
+      }
+      const int32_t err = (int32_t)(bit == 0 ? 2048 - p : 0 - p);
+      const int32_t xs[6] = {kStretch[n[step][0]], kStretch[n[step][1]],
+                             kStretch[n[step][2]], kStretch[n[step][3]],
+                             n4 ? kStretch[n[step][4]] : 0,
+                             kStretch[n[step][5]]};
+      for (int j = 0; j < 6; ++j) {
+        int32_t nw = wl[step][j] + (int32_t)((err * (int64_t)xs[j]) >> esh_);
+        if (nw > kWClamp) nw = kWClamp;
+        if (nw < -kWClamp) nw = -kWClamp;
+        wl[step][j] = nw;
+      }
     }
     return price;
   }

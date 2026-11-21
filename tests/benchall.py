@@ -45,12 +45,14 @@ class Case:
         return comp, raw, t1 - t0, t2 - t1
 
 
-def g0d_case(fast):
+def g0d_case(tier):
+    fast = tier == "fast"
     def c(data):
         p = os.path.join(BUILD, "bench_in")
         open(p, "wb").write(data)
         out = os.path.join(BUILD, "bench_g.szip")
-        args = [G0D, "c"] + (["-f"] if fast else []) + [p, out]
+        args = [G0D, "c"] + (["-f"] if fast else
+                             ["--sprint"] if tier == "sprint" else []) + [p, out]
         r = run(args)
         if r.returncode != 0:
             raise RuntimeError("g0dszip compress failed")
@@ -65,7 +67,9 @@ def g0d_case(fast):
             raise RuntimeError("g0dszip decompress failed")
         return open(out, "rb").read()
 
-    return Case("g0dszip" + (" -f (fast)" if fast else " (best)"), c, d)
+    name = ("g0dszip -f (fast)" if fast else
+            "g0dszip --sprint" if tier == "sprint" else "g0dszip (best)")
+    return Case(name, c, d)
 
 
 def lib_case(name, cfn, dfn):
@@ -73,7 +77,7 @@ def lib_case(name, cfn, dfn):
 
 
 def build_cases():
-    cases = [g0d_case(False), g0d_case(True)]
+    cases = [g0d_case("best"), g0d_case("fast"), g0d_case("sprint")]
     if shutil.which("gzip"):
         cases.append(_shell_case("gzip -9", "gzip -9 -c {inp} > {out}", "gzip -dc {inp} > {out}"))
     if shutil.which("bzip2"):

@@ -19,6 +19,9 @@
 #include "crc32.hpp"
 #include "lz77.hpp"
 #include "mix.hpp"
+#include <condition_variable>
+#include <functional>
+#include "sprint.hpp"
 #ifndef SZ_MATCHBIAS
 #define SZ_MATCHBIAS 16
 #endif
@@ -47,8 +50,8 @@ struct Model {
   Prob is_match = kProbInit;
   Prob is_rep = kProbInit;
   Prob rep_sel[2] = {kProbInit, kProbInit}; // 0: rep0|rep12, 1: rep1|rep2
-  Prob len_unary[10];             // gamma of (len - 2) (regime 0 shared)
-  Prob len_bits[10];
+  Prob len_unary[22];             // gamma of (len - 2) (regime 0 shared)
+  Prob len_bits[22];
   Prob off_mode = kProbInit;      // 0: tiny (off 1-4), 1: slot+direct
   Prob tiny_unary[8];             // gamma of (off), x in [1, 4]
   Prob tiny_bits[8];
@@ -59,10 +62,10 @@ struct Model {
 
   // -- regime-2 extras (appended: v4 field layout above is frozen so old
   //    files decode with byte-identical probability evolution) --
-  Prob nlen_unary[11];            // normal-match length (idx 0..10 used)
-  Prob nlen_bits[11];
-  Prob rlen_unary[11];            // rep length
-  Prob rlen_bits[11];
+  Prob nlen_unary[22];            // normal-match length
+  Prob nlen_bits[22];
+  Prob rlen_unary[22];            // rep length
+  Prob rlen_bits[22];
   Prob slot_cls[4][12];           // slot model per length class
   Prob slotb_cls[4][10];
 
@@ -341,8 +344,7 @@ RepPick rep_match(const uint8_t *src, uint32_t n, uint32_t pos,
   for (uint32_t i = 0; i < 3; ++i) {
     const uint32_t off = reps[i];
     if (off == 0 || off > pos) continue;
-    uint32_t len = 0;
-    while (len < max_len && src[pos + len] == src[pos - off + len]) ++len;
+    const uint32_t len = match_len(src + pos - off, src + pos, max_len);
     if (len >= kMinMatch && len > best.len) {
       best.len = len;
       best.idx = i;
@@ -400,8 +402,8 @@ struct DPNode {
 #define SZ_ABEAM 8
 #endif
 constexpr uint32_t kDPBeam = SZ_ABEAM;
-constexpr uint32_t kBeamSlots = 32; // allocation stride (>= any beam_cap)
-double plan_cost_estimate = 0;
+constexpr uint32_t kBeamSlots = 12; // allocation stride (>= any beam_cap)
+thread_local double plan_cost_estimate = 0;
 
 // lengths whose tokens are evaluated as match edges
 #ifndef SZ_ALLLEN
@@ -411,7 +413,20 @@ double plan_cost_estimate = 0;
 #define SZ_LCAP 0
 #endif
 // Encoder-side parse knob (set_parse_fast): 0 = max ratio, 1 = fast parse.
-static int g_parse_fast = 0;
+static thread_local int g_parse_fast = 0;
+// Hyper tier knobs (set_parse_tier): cache-resident pricing mixer, fewer
+// refinement passes, tighter candidate diet, incompressible pre-reject.
+// Plain globals (NOT thread_local): worker threads must see the same tier
+// as the thread that called set_parse_tier.
+static int g_parse_light = 0;
+static int g_kmax = 2;   // 0 = default (SZ_PASSES)
+static int g_mcc = 2;    // 0 = default (SZ_MCAND path)
+static int g_prereject = 1;
+static int g_beam_ovr = 1;
+static int g_modeset = 8; // bitmask of emitted modes (mode 3: == {2,3} measured)
+static int g_find_lean = 1; // finder: 2 candidates, chain 16 (wide for --max)
+static int g_sprint = 0; // SZPRINT speed tier (snappy/lz4-killer path)
+
 // rank 0 = best candidate (fine lengths); rank > 0 = secondary (coarse).
 static void collect_lens(uint32_t max_len, uint32_t rank,
                          std::vector<uint32_t> &lens) {
@@ -464,19 +479,124 @@ static void collect_lens(uint32_t max_len, uint32_t rank,
 struct CandCache {
   std::vector<uint8_t> cnt;
   std::vector<Match> m; // SZ_CANDW per position
+  std::vector<uint32_t> re; // one-past-end of the maximal equal-byte run
 };
+// Thread count for data-parallel work (deterministic: task results never
+// depend on scheduling).  Small machines are the norm for this tool; the
+// cap keeps pathological hosts from oversubscribing.
+static unsigned sz_workers() {
+  unsigned hw = std::thread::hardware_concurrency();
+  if (hw == 0) hw = 2;
+  return hw < 2 ? 1u : (hw > 8 ? 8u : hw);
+}
+
+// Persistent worker pool: std::thread spawn costs ~300 us on small VMs, which
+// dominated per-batch encoding.  One pool lives for the process; parallel_for
+// fans out fn(0..count-1) across the workers and returns when all finish.
+static std::mutex g_pmu;
+static std::condition_variable g_pgo, g_pdone;
+static std::function<void(uint32_t)> g_pfn;
+static uint32_t g_pcount = 0, g_pfinished = 0, g_pgen = 0, g_pworkers = 0;
+static bool g_pstop = false;
+static std::vector<std::thread> g_pool;
+
+static void pool_worker(uint32_t wid) {
+  uint32_t seen = 0;
+  for (;;) {
+    {
+      std::unique_lock<std::mutex> lk(g_pmu);
+      g_pgo.wait(lk, [&] { return g_pstop || g_pgen != seen; });
+      if (g_pstop) return;
+      seen = g_pgen;
+    }
+    for (uint32_t i = wid; i < g_pcount; i += g_pworkers) g_pfn(i);
+    {
+      std::lock_guard<std::mutex> lk(g_pmu);
+      if (++g_pfinished == g_pworkers) g_pdone.notify_one();
+    }
+  }
+}
+
+static void pool_shutdown() {
+  {
+    std::lock_guard<std::mutex> lk(g_pmu);
+    g_pstop = true;
+    g_pgo.notify_all();
+  }
+  for (auto &t : g_pool)
+    if (t.joinable()) t.join();
+}
+
+static void pool_ensure() {
+  std::lock_guard<std::mutex> lk(g_pmu);
+  if (!g_pool.empty()) return;
+  g_pworkers = sz_workers();
+  for (uint32_t w = 0; w < g_pworkers; ++w)
+    g_pool.emplace_back(pool_worker, w);
+  std::atexit(pool_shutdown);
+}
+
+static void parallel_for(uint32_t count,
+                         const std::function<void(uint32_t)> &fn) {
+  if (count == 0) return;
+  if (count == 1) {
+    fn(0);
+    return;
+  }
+  pool_ensure();
+  {
+    std::lock_guard<std::mutex> lk(g_pmu);
+    g_pfn = fn;
+    g_pcount = count;
+    g_pfinished = 0;
+    ++g_pgen;
+    g_pgo.notify_all();
+  }
+  {
+    std::unique_lock<std::mutex> lk(g_pmu);
+    g_pdone.wait(lk, [] { return g_pfinished == g_pworkers; });
+  }
+}
+
 static void build_cand_cache(const uint8_t *src, uint32_t n, CandCache &cc) {
   cc.cnt.assign(n, 0);
   cc.m.assign((size_t)n * SZ_CANDW, Match{0, 0});
-  MatchFinder mf;
-  mf.prepare(n);
+  cc.re.assign(n, 0);
+  for (uint32_t i = n; i-- > 0;)
+    cc.re[i] = (i + 1 < n && src[i] == src[i + 1]) ? cc.re[i + 1] : i + 1;
+  // Phase 1 (sequential, cheap): hash links only.  link1[p] = previous
+  // inserted same-hash position + 1 (0 = none) — exactly the chain order
+  // the sequential head_/prev_ finder would produce.
+  std::vector<uint32_t> head(kHashSize, 0);
+  std::vector<uint32_t> link1(n, 0);
   for (uint32_t pos = 0; pos < n; ++pos) {
-    mf.insert(src, n, pos);
-    Match tmp[SZ_CANDW];
-    const uint32_t k = mf.find_multi(src, n, pos, tmp, SZ_CANDW);
-    cc.cnt[pos] = (uint8_t)k;
-    for (uint32_t i = 0; i < k; ++i) cc.m[(size_t)pos * SZ_CANDW + i] = tmp[i];
+    if (pos + kMinMatch > n) continue;
+    const uint32_t h = MatchFinder::hash3(src + pos);
+    link1[pos] = head[h];
+    head[h] = pos + 1;
   }
+  // Phase 2 (parallel): per-position walks are independent and write
+  // disjoint cache slots.  Results are identical to the sequential finder.
+  MatchFinder mf;
+  const unsigned nw = sz_workers();
+  std::vector<std::thread> ths;
+  for (unsigned t = 0; t < nw; ++t) {
+    const uint32_t lo = (uint32_t)((uint64_t)n * t / nw);
+    const uint32_t hi = (uint32_t)((uint64_t)n * (t + 1) / nw);
+    ths.emplace_back([&, lo, hi] {
+      Match tmp[SZ_CANDW];
+      for (uint32_t pos = lo; pos < hi; ++pos) {
+        const uint32_t k =
+            mf.find_multi_link(src, n, pos, link1.data(), tmp,
+                               g_find_lean ? 2u : (uint32_t)SZ_CANDW,
+                               g_find_lean ? 16u : (uint32_t)SZ_CHAIN,
+                               (uint32_t)SZ_NICE);
+        cc.cnt[pos] = (uint8_t)k;
+        for (uint32_t i = 0; i < k; ++i) cc.m[(size_t)pos * SZ_CANDW + i] = tmp[i];
+      }
+    });
+  }
+  for (auto &t : ths) t.join();
 }
 
 void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
@@ -512,7 +632,7 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
 
   Model ms(mode >= 2 ? 2u : 0u); // online-calibrated price model
   std::unique_ptr<MixLit> mix;   // live literal prices (unguided pass only)
-  if (!guide) mix.reset(new MixLit(mode & 1u));
+  if (!guide) mix.reset(new MixLit(mode & 1u, g_parse_light != 0));
   Hist hist;
 
   std::vector<DPNode> pool;
@@ -521,6 +641,10 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
   free_nodes.reserve(256);
   std::vector<uint32_t> best_cnt(n + 1, 0);
   std::vector<uint32_t> best_slot((size_t)(n + 1) * kBeamSlots, 0);
+  // Exact worst-cost cache per position list (UINT64_MAX = unknown/stale).
+  // Makes the common "cannot beat the worst entry" rejection O(1) instead
+  // of a pool scan; semantics of the full path are unchanged.
+  std::vector<uint64_t> best_worstc(n + 1, UINT64_MAX);
 
   DPNode start;
   start.cost = 0;
@@ -532,7 +656,8 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
   best_cnt[0] = 1;
 
   const uint32_t beam_cap =
-      g_parse_fast ? (g_parse_fast >= 2 ? 2u : 4u)
+      g_beam_ovr ? (uint32_t)g_beam_ovr
+      : g_parse_fast ? (g_parse_fast >= 2 ? 2u : 4u)
       : (guide ? ((uint32_t)SZ_GBEAM < kBeamSlots ? (uint32_t)SZ_GBEAM
                                                : kBeamSlots)
                : kDPBeam);
@@ -552,28 +677,40 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
   auto try_insert = [&](uint32_t q, const DPNode &nd) {
     uint32_t *lst = &best_slot[(size_t)q * kBeamSlots];
     uint32_t &cnt = best_cnt[q];
+    const uint64_t ndc = nd.cost;
+    // Fast reject: a full list rejects anything >= its worst entry (and a
+    // same-reps replace would need to beat that entry's cost too).  Exact.
+    const uint64_t wc = best_worstc[q];
+    if (cnt >= beam_cap && wc != UINT64_MAX && ndc >= wc) return;
+    const uint32_t r0 = nd.reps[0], r1 = nd.reps[1], r2 = nd.reps[2];
     uint32_t worst = 0;
+    uint64_t w1 = 0, w2 = 0;
     for (uint32_t i = 0; i < cnt; ++i) {
       const uint32_t old = lst[i];
       const DPNode &o = pool[old];
-      if (o.reps[0] == nd.reps[0] && o.reps[1] == nd.reps[1] &&
-          o.reps[2] == nd.reps[2]) {
-        if (nd.cost < o.cost) {
+      if (o.reps[0] == r0 && o.reps[1] == r1 && o.reps[2] == r2) {
+        if (ndc < o.cost) {
           lst[i] = new_node(nd);
           free_nodes.push_back(old);
+          best_worstc[q] = UINT64_MAX; // worst may have moved; recompute lazily
         }
         return;
       }
-      if (o.cost > pool[lst[worst]].cost) worst = i;
+      if (o.cost > w1) { w2 = w1; w1 = o.cost; worst = i; }
+      else if (i != worst && o.cost > w2) w2 = o.cost;
     }
     if (cnt < beam_cap) {
       lst[cnt++] = new_node(nd);
+      best_worstc[q] = ndc > w1 ? ndc : w1;
       return;
     }
-    if (nd.cost < pool[lst[worst]].cost) {
+    if (ndc < w1) {
       const uint32_t old = lst[worst];
       lst[worst] = new_node(nd);
       free_nodes.push_back(old);
+      best_worstc[q] = ndc > w2 ? ndc : w2;
+    } else {
+      best_worstc[q] = w1;
     }
   };
 
@@ -584,8 +721,10 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
   std::vector<uint32_t> lenst(kMaxMatch + 1, 0);
   uint32_t lenst_cur = 0;
 
+  double tp_peek = 0, tp_dp = 0, tp_rep = 0, tp_norm = 0;
   for (uint32_t pos = 0; pos < n; ++pos) {
     if (best_cnt[pos] == 0) continue;
+    auto __t0 = std::chrono::steady_clock::now();
 
     // calibrate the price model
     uint8_t mb = 0;
@@ -617,14 +756,18 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
     if (guide) {
       litp = litp_cache[pos]; // exact price cached by the unguided pass
     } else {
+      auto __t1 = std::chrono::steady_clock::now();
       litp = mix->peek(hist, src[pos], mb, st);
       litp_cache[pos] = litp;
+      tp_peek += std::chrono::duration<double>(std::chrono::steady_clock::now() - __t1).count();
     }
+    tp_dp += std::chrono::duration<double>(std::chrono::steady_clock::now() - __t0).count();
 #if SZ_STATS
     plan_cost_estimate += (double)litp; // debug: sum of literal prices
 #endif
     Match cands[16];
-    const uint32_t mcc = g_parse_fast ? 6u : (uint32_t)SZ_MCAND;
+    const uint32_t mcc = g_mcc ? (uint32_t)g_mcc
+                               : g_parse_fast ? 6u : (uint32_t)SZ_MCAND;
     const uint32_t ncand = SZ_DP_NO_NORM ? 0u : cc.cnt[pos];
     for (uint32_t i = 0; i < ncand && i < mcc; ++i)
       cands[i] = cc.m[(size_t)pos * SZ_CANDW + i];
@@ -636,6 +779,7 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
     uint32_t offp[16][4]; // regime 2: offset price per length class
     ++lenst_cur;
     auto plen = [&](uint32_t l, bool is_rep) -> uint32_t {
+      if (l > kMaxMatch) return price_len(ms, is_rep, l);
       if (lenst[l] != lenst_cur) {
         lenst[l] = lenst_cur;
         if (ms.regime) {
@@ -676,14 +820,22 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
       }
 
       // rep edges from this arrival's offsets
+      auto __t3 = std::chrono::steady_clock::now();
       if (!SZ_DP_NO_REP) {
         const RepPick rep = rep_match(src, n, pos, A.reps);
         if (rep.len >= kMinMatch) {
+          // a dist-1 rep inside a run extends past the finder cap (run token)
+          uint32_t run_ext =
+              (pos > 0 && A.reps[rep.idx] == 1 && src[pos] == src[pos - 1])
+                  ? cc.re[pos] - pos
+                  : 0;
+          if (run_ext > SZIP_MAX_RUN) run_ext = SZIP_MAX_RUN;
+          const uint32_t rep_max = run_ext > rep.len ? run_ext : rep.len;
           const uint32_t rep_prefix =
               price_bit(ms.is_match, 1) + price_bit(ms.is_rep, 1) +
               price_bit(ms.rep_sel[0], rep.idx == 0 ? 0u : 1u) +
               (rep.idx != 0 ? price_bit(ms.rep_sel[1], rep.idx == 1 ? 0u : 1u) : 0u);
-          collect_lens(rep.len, 0, lens);
+          collect_lens(rep_max, 0, lens);
           DPNode nd = A;
           nd.prev = idx;
           nd.off = 0;
@@ -697,6 +849,27 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
         }
       }
 
+      // run edge: dist-1 whole-run match past the 2 KiB finder cap.  A
+      // dist-1 match is by definition a run of one byte, so one token can
+      // carry the entire run (the format's gamma length covers up to 2^21).
+      if (pos > 0 && src[pos] == src[pos - 1]) {
+        uint32_t run_len = cc.re[pos] - pos;
+        if (run_len > SZIP_MAX_RUN) run_len = SZIP_MAX_RUN;
+        if (run_len > kMaxMatch) {
+          DPNode nd = A;
+          nd.prev = idx;
+          nd.off = 1;
+          nd.rep_idx = UINT32_MAX;
+          reps_after_normal(nd.reps, 1);
+          nd.cost = A.cost + price_bit(ms.is_match, 1) + price_bit(ms.is_rep, 0) +
+                    price_offset_p(ms, 1, 2) + plen(run_len, false);
+          nd.len = run_len;
+          try_insert(pos + run_len, nd);
+        }
+      }
+
+      tp_rep += std::chrono::duration<double>(std::chrono::steady_clock::now() - __t3).count();
+      auto __t4 = std::chrono::steady_clock::now();
       // normal-match edges: every candidate distance, priced exactly
       for (uint32_t ci = 0; ci < ncand && ci < mcc; ++ci) {
         const Match &nm = cands[ci];
@@ -714,11 +887,21 @@ void plan_block_pass(const uint8_t *src, uint32_t n, std::vector<PlanTok> &plan,
           try_insert(pos + l, nd);
         }
       }
+      tp_norm += std::chrono::duration<double>(std::chrono::steady_clock::now() - __t4).count();
     }
-
+    auto __t5 = std::chrono::steady_clock::now();
     // advance the raw-prefix model after pricing this position (unguided only)
     if (!guide) mix->train_byte(hist, src[pos], mb, st);
+#if SZ_TIME
+    tp_dp += std::chrono::duration<double>(std::chrono::steady_clock::now() - __t5).count();
+#else
+    (void)__t5;
+#endif
   }
+#if SZ_TIME
+  fprintf(stderr, "[pp] n=%u guide=%d calib=%6.3f peek=%6.3f rep=%6.3f norm=%6.3f\n",
+          n, guide ? 1 : 0, tp_dp, tp_peek, tp_rep, tp_norm);
+#endif
 
 #if SZ_STATS
   fprintf(stderr, "[pool] mode=%u guide=%d n=%u pool=%zu cap=%zu\n",
@@ -874,7 +1057,8 @@ static void encode_one_mode(const uint8_t *src, uint32_t n, uint32_t mode,
   SZ_TIC(t0);
   plan_block_pass(src, n, plans[0], nullptr, mode, cc, litp_cache);
   size_t nplans = 1;
-  const size_t kmax_pass = (g_parse_fast >= 2) ? 2u : (size_t)SZ_PASSES;
+  const size_t kmax_pass = g_kmax ? (size_t)g_kmax
+                                  : (g_parse_fast >= 2) ? 2u : (size_t)SZ_PASSES;
   for (size_t k = 1; k < kmax_pass; ++k) {
     plan_block_pass(src, n, plans[k], &plans[k - 1], mode, cc, litp_cache);
     nplans = k + 1;
@@ -905,10 +1089,70 @@ void encode_block_szlzrc(const uint8_t *src, uint32_t n,
                          std::vector<uint8_t> &out) {
   out.clear();
   if (n == 0) return;
+  // Incompressible pre-reject (hyper/fast tiers): when the byte entropy is
+  // within 0.02 bits/byte of random, no coder can beat the bare frame by a
+  // meaningful margin.  Return the raw block so the container stores it —
+  // the output is exactly what the full search produces for such data.
+  if (g_prereject && n >= 4096) {
+    uint32_t cnt[256] = {0};
+    for (uint32_t i = 0; i < n; ++i) ++cnt[src[i]];
+    double h = 0.0;
+    for (uint32_t c : cnt)
+      if (c) h += (double)c * -__builtin_log2((double)c / (double)n);
+    if (h >= 7.98 * (double)n) {
+      out.push_back((uint8_t)(7u << 3)); // stored sub-mode (delta_id 7)
+      out.insert(out.end(), src, src + n);
+      return;
+    }
+  }
   SZ_TIC(tc);
   CandCache cc;
   build_cand_cache(src, n, cc);
   SZ_TOC(tc, "finder cache");
+  // The BWT/delta family is independent of the LZ parse: start it now so
+  // it occupies the spare core while the (single-threaded) parse chain runs.  Selection happens after the join — output is identical.
+  std::vector<uint8_t> best_bwt;
+  uint32_t best_delta = 0;
+  SZ_TIC(tbw);
+  std::thread bwt_thread([&] {
+    static const uint32_t kDeltas[4] = {1, 2, 4, 8};
+    // Gap-entropy proxy picks the one delta worth encoding alongside raw
+    // (measured: only pcm ever wins via delta, and its d=2 gap entropy is
+    // far below the rest).  Two BWT encodes instead of five.
+    uint32_t pick = 0;
+    {
+      double best_h = -1.0;
+      for (uint32_t di = 0; di < 4; ++di) {
+        const uint32_t dlt = kDeltas[di];
+        uint32_t cnt[256] = {0};
+        for (uint32_t i = dlt; i < n; ++i) {
+          const uint8_t v = (uint8_t)(src[i] - src[i - dlt]);
+          ++cnt[v];
+        }
+        double h = 0;
+        for (uint32_t c : cnt)
+          if (c) h += (double)c * -__builtin_log2((double)c / (double)(n - dlt ? n - dlt : 1));
+        if (best_h < 0 || h < best_h) { best_h = h; pick = di; }
+      }
+    }
+    std::vector<std::vector<uint8_t>> pay(2);
+    std::vector<uint8_t> dtmp;
+    std::vector<std::thread> ths;
+    ths.emplace_back([&] { bwt::encode_block(src, n, pay[0]); });
+    ths.emplace_back([&, pick] {
+      const uint32_t dlt = kDeltas[pick];
+      dtmp.resize(n);
+      for (uint32_t i = 0; i < n; ++i)
+        dtmp[i] = (uint8_t)(src[i] - (i >= dlt ? src[i - dlt] : 0));
+      bwt::encode_block(dtmp.data(), n, pay[1]);
+    });
+    for (auto &t : ths) t.join();
+    best_bwt.swap(pay[0]);
+    if (pay[1].size() < best_bwt.size()) {
+      best_bwt.swap(pay[1]);
+      best_delta = pick + 1;
+    }
+  });
   std::vector<uint8_t> cand[4];
   const bool user_fast = g_parse_fast != 0;
   // Phase 1: ONE parse (tight regime, word-shape prices) with refinement
@@ -921,79 +1165,43 @@ void encode_block_szlzrc(const uint8_t *src, uint32_t n,
     std::vector<uint32_t> litp_cache(n, 0);
     std::vector<PlanTok> plan, prev;
     SZ_TIC(tp);
+    SZ_TIC(tp0);
     plan_block_pass(src, n, plan, nullptr, 2, cc, litp_cache);
-    const size_t kmax_pass = (g_parse_fast >= 2) ? 2u : (size_t)SZ_PASSES;
+    SZ_TOC(tp0, "pass 0 (unguided)");
+    const size_t kmax_pass = g_kmax ? (size_t)g_kmax
+                                    : (g_parse_fast >= 2) ? 2u : (size_t)SZ_PASSES;
     for (size_t k = 1; k < kmax_pass; ++k) {
       prev.clear();
       prev.swap(plan);
+      SZ_TIC(tpg);
       plan_block_pass(src, n, plan, &prev, 2, cc, litp_cache);
+      SZ_TOC(tpg, "guided pass");
       if (same_plan(plan, prev)) break;
     }
     SZ_TOC(tp, "passes (single)");
     SZ_TIC(te);
     {
-      std::thread t01([&] {
-        emit_plan(src, n, plan, cand[0], 0);
-        emit_plan(src, n, plan, cand[1], 1);
-      });
-      std::thread t23([&] {
-        emit_plan(src, n, plan, cand[2], 2);
-        emit_plan(src, n, plan, cand[3], 3);
-      });
-      t01.join();
-      t23.join();
+      const unsigned ew =
+        std::min(4u, std::max(2u, (unsigned)std::thread::hardware_concurrency()));
+      std::vector<std::thread> ths;
+      for (unsigned t = 0; t < ew; ++t)
+        ths.emplace_back([&, t] {
+          for (uint32_t m = t; m < 4; m += ew)
+            if (g_modeset & (1 << m)) emit_plan(src, n, plan, cand[m], m);
+        });
+      for (auto &th : ths) th.join();
     }
     SZ_TOC(te, "emits (x4)");
   }
   set_parse_fast(user_fast ? 1 : 0);
-  uint32_t best = 0;
-  for (uint32_t k = 1; k < 4; ++k)
-    if (cand[k].size() < cand[best].size()) best = k;
+  uint32_t best = UINT32_MAX;
+  for (uint32_t k = 0; k < 4; ++k)
+    if ((g_modeset & (1 << k)) && (best == UINT32_MAX || cand[k].size() < cand[best].size())) best = k;
   const size_t cheap_best = cand[best].size();
-  // BWT/delta family (cheap: suffix array + 4 mixer streams per transform):
-  // the raw block and byte-delta transforms d = 1,2,4,8 (mode bits 3-5).
-  std::vector<uint8_t> best_bwt;
-  uint32_t best_delta = 0;
-  {
-    SZ_TIC(tbw);
-    static const uint32_t kDeltas[4] = {1, 2, 4, 8};
-    // Gap-entropy proxy picks the one delta worth encoding alongside raw
-    // (measured: only pcm ever wins via delta, and its d=2 gap entropy is
-    // far below the rest).  Two BWT encodes instead of five.
-    uint32_t pick = 0;
-    {
-      double best_h = -1.0;
-      for (uint32_t di = 0; di < 4; ++di) {
-        const uint32_t d = kDeltas[di];
-        uint32_t cnt[256] = {0};
-        for (uint32_t i = d; i < n; ++i) {
-          const uint8_t v = (uint8_t)(src[i] - src[i - d]);
-          ++cnt[v];
-        }
-        double h = 0;
-        for (uint32_t c : cnt)
-          if (c) h += (double)c * -__builtin_log2((double)c / (double)(n - d ? n - d : 1));
-        if (best_h < 0 || h < best_h) { best_h = h; pick = di; }
-      }
-    }
-    std::vector<std::vector<uint8_t>> pay(2), dtmp(1);
-    std::vector<std::thread> ths;
-    ths.emplace_back([&] { bwt::encode_block(src, n, pay[0]); });
-    ths.emplace_back([&, pick] {
-      const uint32_t d = kDeltas[pick];
-      dtmp[0].resize(n);
-      for (uint32_t i = 0; i < n; ++i)
-        dtmp[0][i] = (uint8_t)(src[i] - (i >= d ? src[i - d] : 0));
-      bwt::encode_block(dtmp[0].data(), n, pay[1]);
-    });
-    for (auto &t : ths) t.join();
-    best_bwt.swap(pay[0]);
-    if (pay[1].size() < best_bwt.size()) {
-      best_bwt.swap(pay[1]);
-      best_delta = pick + 1;
-    }
-    SZ_TOC(tbw, "bwt family");
-  }
+  // (the BWT/delta family has been running concurrently since the top of
+  // this function — join it now)
+  bwt_thread.join();
+  SZ_TOC(tbw, "bwt family (overlapped)");
   // Phase 2 (deep parse): run the expensive modes only when they could
   // still beat the cheap best (the deep parse historically buys ~0-0.5%).
   // Skip the deep wave when the cheap parse already dominates: BWT does not
@@ -1021,9 +1229,9 @@ void encode_block_szlzrc(const uint8_t *src, uint32_t n,
     }
     for (uint32_t k = 0; k < 4; ++k)
       if (deep[k].size() < cand[k].size()) cand[k].swap(deep[k]);
-    best = 0;
-    for (uint32_t k = 1; k < 4; ++k)
-      if (cand[k].size() < cand[best].size()) best = k;
+    best = UINT32_MAX;
+    for (uint32_t k = 0; k < 4; ++k)
+      if ((g_modeset & (1 << k)) && (best == UINT32_MAX || cand[k].size() < cand[best].size())) best = k;
   }
   if (best_bwt.size() < cand[best].size()) {
     out.push_back((uint8_t)((best_delta << 3) | 4u));
@@ -1041,6 +1249,13 @@ int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
   const uint32_t mode = src[0];
   const uint32_t delta_id = (mode >> 3) & 7u;
   static const uint32_t kDeltas[5] = {0, 1, 2, 4, 8};
+  // delta_id 7 (bit 2 clear) = stored sub-mode: payload is mode byte + raw.
+  // Used by the incompressible pre-reject; containers strip it to raw anyway.
+  if (delta_id == 7 && !(mode & 4u)) {
+    if (src_len != (size_t)n + 1) return SZIP_ERR_FORMAT;
+    if (n) std::memcpy(dst, src + 1, n);
+    return SZIP_OK;
+  }
   if (delta_id > 4) return SZIP_ERR_CORRUPT;
   const uint32_t delta = kDeltas[delta_id];
   if (mode & 4u) {
@@ -1076,12 +1291,12 @@ int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
 
       uint32_t xlen = 0;
       int e = m.regime
-                  ? decode_gamma(rc, m.rlen_unary, m.rlen_bits, 10, &xlen)
-                  : decode_gamma(rc, m.len_unary, m.len_bits, 10, &xlen);
+                  ? decode_gamma(rc, m.rlen_unary, m.rlen_bits, 21, &xlen)
+                  : decode_gamma(rc, m.len_unary, m.len_bits, 21, &xlen);
       if (e != SZIP_OK) return e;
       if (!rc.ok()) return SZIP_ERR_TRUNCATED;
       const uint32_t len = xlen + 2;
-      if (len < kMinMatch || len > kMaxMatch) return SZIP_ERR_CORRUPT;
+      if (len < kMinMatch || len > SZIP_MAX_RUN) return SZIP_ERR_CORRUPT;
       const uint32_t off = reps[idx];
       if (off == 0 || off > out_pos) return SZIP_ERR_CORRUPT;
       if (len > n - out_pos) return SZIP_ERR_CORRUPT;
@@ -1101,22 +1316,22 @@ int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
       int e;
       if (m.regime) {
         // tight regime: length first, then class-aware offset
-        e = decode_gamma(rc, m.nlen_unary, m.nlen_bits, 10, &xlen);
+        e = decode_gamma(rc, m.nlen_unary, m.nlen_bits, 21, &xlen);
         if (e != SZIP_OK) return e;
         if (!rc.ok()) return SZIP_ERR_TRUNCATED;
         const uint32_t len = xlen + 2;
-        if (len < kMinMatch || len > kMaxMatch) return SZIP_ERR_CORRUPT;
+        if (len < kMinMatch || len > SZIP_MAX_RUN) return SZIP_ERR_CORRUPT;
         e = decode_offset(rc, m, len, &off);
         if (e != SZIP_OK) return e;
       } else {
         e = decode_offset(rc, m, 2, &off);
         if (e != SZIP_OK) return e;
-        e = decode_gamma(rc, m.len_unary, m.len_bits, 10, &xlen);
+        e = decode_gamma(rc, m.len_unary, m.len_bits, 21, &xlen);
         if (e != SZIP_OK) return e;
       }
       if (!rc.ok()) return SZIP_ERR_TRUNCATED;
       const uint32_t len = xlen + 2;
-      if (len < kMinMatch || len > kMaxMatch) return SZIP_ERR_CORRUPT;
+      if (len < kMinMatch || len > SZIP_MAX_RUN) return SZIP_ERR_CORRUPT;
       if (off == 0 || off > out_pos) return SZIP_ERR_CORRUPT;
       if (len > n - out_pos) return SZIP_ERR_CORRUPT;
 
@@ -1141,19 +1356,11 @@ int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
 
 // ------------------------------------------------------------- le helpers --
 
-void put_u16(std::ostream &os, uint16_t v) {
-  char b[2] = {static_cast<char>(v & 0xFF), static_cast<char>((v >> 8) & 0xFF)};
-  os.write(b, 2);
-}
 void put_u32(std::ostream &os, uint32_t v) {
   char b[4] = {static_cast<char>(v & 0xFF), static_cast<char>((v >> 8) & 0xFF),
                static_cast<char>((v >> 16) & 0xFF),
                static_cast<char>((v >> 24) & 0xFF)};
   os.write(b, 4);
-}
-void put_u64(std::ostream &os, uint64_t v) {
-  put_u32(os, static_cast<uint32_t>(v & 0xFFFFFFFFu));
-  put_u32(os, static_cast<uint32_t>(v >> 32));
 }
 bool get_u16(std::istream &is, uint16_t *v) {
   unsigned char b[2];
@@ -1176,16 +1383,26 @@ bool get_u64(std::istream &is, uint64_t *v) {
   return true;
 }
 
-bool write_header(std::ostream &os, uint32_t block_size, uint64_t total_raw) {
-  char magic[4] = {SZIP_MAGIC0, SZIP_MAGIC1, SZIP_MAGIC2, SZIP_MAGIC3};
-  os.write(magic, 4);
-  char ver = SZIP_VERSION, flags = 0;
-  os.write(&ver, 1);
-  os.write(&flags, 1);
-  put_u16(os, 0);
-  put_u32(os, block_size);
-  put_u64(os, total_raw);
-  return static_cast<bool>(os);
+// v7 compact container: 4-byte magic ('SZP', 0x40|ver), then blocks of
+// [type u8][raw u24][comp u24] + payload, then a 4-byte CRC32 at EOF.  The
+// legacy v4-v6 container (20-byte header, 10-byte block headers, trailing
+// end magic) is still read; new archives are always v7.
+inline void write_compact_magic(std::ostream &os) {
+  char hdr[4] = {(char)SZIP_MAGIC0, (char)SZIP_MAGIC1, (char)SZIP_MAGIC2,
+                 (char)(SZIP_COMPACT_FLAG | SZIP_VERSION)};
+  os.write(hdr, 4);
+}
+inline void write_compact_block(std::ostream &os, uint8_t type,
+                                uint32_t raw_size, uint32_t comp_size) {
+  char bh[SZIP_V7_BLOCK_HEADER_SIZE];
+  bh[0] = (char)type;
+  bh[1] = (char)(raw_size & 0xFF);
+  bh[2] = (char)((raw_size >> 8) & 0xFF);
+  bh[3] = (char)((raw_size >> 16) & 0xFF);
+  bh[4] = (char)(comp_size & 0xFF);
+  bh[5] = (char)((comp_size >> 8) & 0xFF);
+  bh[6] = (char)((comp_size >> 16) & 0xFF);
+  os.write(bh, SZIP_V7_BLOCK_HEADER_SIZE);
 }
 
 // Bare stored form (v6+): 'S','Z','P',(0x80|ver) + raw bytes to EOF.
@@ -1197,6 +1414,10 @@ inline bool is_bare_magic(const unsigned char m[4]) {
 }
 inline int bare_version(const unsigned char m[4]) {
   return m[3] & ~SZIP_BARE_FLAG;
+}
+inline bool is_compact_magic(const unsigned char m[4]) {
+  return m[0] == SZIP_MAGIC0 && m[1] == SZIP_MAGIC1 && m[2] == SZIP_MAGIC2 &&
+         (m[3] & SZIP_COMPACT_FLAG) != 0 && (m[3] & SZIP_BARE_FLAG) == 0;
 }
 
 int read_and_check_header(std::istream &is, uint32_t *block_size,
@@ -1240,8 +1461,50 @@ int read_and_check_block_header(std::istream &is, uint8_t *type,
 
 void set_parse_fast(int fast) { g_parse_fast = fast < 0 ? 0 : fast; }
 
+void set_parse_tier(const char *tier) {
+  if (!tier || !*tier) return;
+  if (std::strcmp(tier, "sprint") == 0) {
+    g_sprint = 1;
+    return;
+  }
+  g_sprint = 0;
+  if (std::strcmp(tier, "max") == 0) {
+    // Byte-exact deep search: the historical engine (golden sizes).
+    g_parse_light = 0; g_kmax = 0; g_mcc = 0; g_prereject = 0;
+    g_beam_ovr = 0; g_modeset = 15; g_find_lean = 0;
+  } else if (std::strcmp(tier, "fast") == 0) {
+    // Speed freak: no refinement pass at all, tiny pricing mixer.
+    g_parse_light = 1; g_kmax = 1; g_mcc = 2; g_prereject = 1;
+    g_beam_ovr = 1; g_modeset = 8; g_find_lean = 1;
+  } else { // "hyper" — default reality-bend tier
+    // Ablation-verified: keeps every win row of the 14W/6L scoreboard.
+    g_parse_light = 0; g_kmax = 2; g_mcc = 2; g_prereject = 1;
+    g_beam_ovr = 1; g_modeset = 8; // mode 3 only (measured == {2,3} == min-of-4)
+    g_find_lean = 1;
+  }
+  // Ablation/debug overrides: SZIP_LIGHT=0/1 SZIP_KMAX=n SZIP_MCC=n
+  if (const char *e = std::getenv("SZIP_LIGHT")) g_parse_light = std::atoi(e);
+  if (const char *e = std::getenv("SZIP_KMAX")) g_kmax = std::atoi(e);
+  if (const char *e = std::getenv("SZIP_MCC")) g_mcc = std::atoi(e);
+  if (const char *e = std::getenv("SZIP_BEAM")) g_beam_ovr = std::atoi(e);
+  if (const char *e = std::getenv("SZIP_MODESET")) g_modeset = std::atoi(e);
+  if (const char *e = std::getenv("SZIP_MODES")) g_modeset = (1 << std::atoi(e)) - 1;
+}
+
+static void encode_block_auto(const uint8_t *src, uint32_t n,
+                              std::vector<uint8_t> &payload, uint8_t &type) {
+  if (g_sprint) {
+    sprint::compress(src, n, payload);
+    type = SZIP_BLOCK_SPRINT;
+  } else {
+    encode_block_szlzrc(src, n, payload);
+    type = SZIP_BLOCK_SZLZRC;
+  }
+}
+
 int compress_file(const std::string &in_path, const std::string &out_path,
                   uint32_t block_size) {
+  if (g_sprint && block_size > (256u << 10)) block_size = 256u << 10;
   if (block_size == 0 || block_size > (1u << 24)) return SZIP_ERR_FORMAT;
 
   std::ifstream is(in_path, std::ios::binary);
@@ -1262,8 +1525,11 @@ int compress_file(const std::string &in_path, const std::string &out_path,
         !is.read(reinterpret_cast<char *>(raw.data()), (std::streamsize)total))
       return SZIP_ERR_IO;
     std::vector<uint8_t> payload;
-    encode_block_szlzrc(raw.data(), static_cast<uint32_t>(total), payload);
-    if (payload.size() >= (size_t)total) {
+    uint8_t btype = SZIP_BLOCK_SZLZRC;
+    encode_block_auto(raw.data(), static_cast<uint32_t>(total), payload, btype);
+    // Bare frame wins unless compression saves at least the 15-byte compact
+    // overhead (bare file = raw + 4).
+    if (payload.size() + 11 >= (size_t)total) {
       char hdr[4] = {(char)SZIP_MAGIC0, (char)SZIP_MAGIC1, (char)SZIP_MAGIC2,
                      (char)(SZIP_BARE_FLAG | SZIP_VERSION)};
       os.write(hdr, 4);
@@ -1272,72 +1538,56 @@ int compress_file(const std::string &in_path, const std::string &out_path,
                  (std::streamsize)total);
       return os ? SZIP_OK : SZIP_ERR_IO;
     }
-    if (!write_header(os, block_size, total)) return SZIP_ERR_IO;
-    char hdr[SZIP_BLOCK_HEADER_SIZE];
-    hdr[0] = SZIP_BLOCK_SZLZRC;
-    hdr[1] = 0;
-    hdr[2] = static_cast<char>(total & 0xFF);
-    hdr[3] = static_cast<char>((total >> 8) & 0xFF);
-    hdr[4] = static_cast<char>((total >> 16) & 0xFF);
-    hdr[5] = static_cast<char>((total >> 24) & 0xFF);
-    const uint32_t comp_size = static_cast<uint32_t>(payload.size());
-    hdr[6] = static_cast<char>(comp_size & 0xFF);
-    hdr[7] = static_cast<char>((comp_size >> 8) & 0xFF);
-    hdr[8] = static_cast<char>((comp_size >> 16) & 0xFF);
-    hdr[9] = static_cast<char>((comp_size >> 24) & 0xFF);
-    os.write(hdr, SZIP_BLOCK_HEADER_SIZE);
-    os.write(reinterpret_cast<const char *>(payload.data()), comp_size);
+    write_compact_magic(os);
+    write_compact_block(os, btype,
+                        static_cast<uint32_t>(total),
+                        static_cast<uint32_t>(payload.size()));
+    os.write(reinterpret_cast<const char *>(payload.data()),
+             (std::streamsize)payload.size());
     put_u32(os, szip_crc32(raw.data(), (size_t)total));
-    char magic[4] = {SZIP_MAGIC0, SZIP_MAGIC1, SZIP_MAGIC2, SZIP_MAGIC3};
-    os.write(magic, 4);
     return os ? SZIP_OK : SZIP_ERR_IO;
   }
 
-  if (!write_header(os, block_size, total)) return SZIP_ERR_IO;
+  write_compact_magic(os);
 
-  std::vector<uint8_t> block(block_size);
-  std::vector<uint8_t> payload;
+  // Blocks are independent: encode a group of blocks in parallel, then
+  // write them in order.  Output is byte-identical to the serial loop.
   uint32_t crc = 0;
   uint64_t remaining = total;
-
+  const unsigned nw = sz_workers();
+  std::vector<std::vector<uint8_t>> raws(nw), pays(nw);
+  std::vector<uint32_t> wants(nw);
   while (remaining > 0) {
-    const uint32_t want =
-        static_cast<uint32_t>(std::min<uint64_t>(block_size, remaining));
-    if (!is.read(reinterpret_cast<char *>(block.data()), want)) return SZIP_ERR_IO;
-    crc = szip_crc32_update(crc, block.data(), want);
-
-    // DP optimal parse is parameter-free; encoder-side only.
-    encode_block_szlzrc(block.data(), want, payload);
-    const bool store = payload.size() >= want;
-    const uint32_t comp_size =
-        store ? want : static_cast<uint32_t>(payload.size());
-
-    // Block header, explicitly little-endian.
-    char hdr[SZIP_BLOCK_HEADER_SIZE];
-    hdr[0] = store ? SZIP_BLOCK_STORED : SZIP_BLOCK_SZLZRC;
-    hdr[1] = 0;
-    hdr[2] = static_cast<char>(want & 0xFF);
-    hdr[3] = static_cast<char>((want >> 8) & 0xFF);
-    hdr[4] = static_cast<char>((want >> 16) & 0xFF);
-    hdr[5] = static_cast<char>((want >> 24) & 0xFF);
-    hdr[6] = static_cast<char>(comp_size & 0xFF);
-    hdr[7] = static_cast<char>((comp_size >> 8) & 0xFF);
-    hdr[8] = static_cast<char>((comp_size >> 16) & 0xFF);
-    hdr[9] = static_cast<char>((comp_size >> 24) & 0xFF);
-    os.write(hdr, SZIP_BLOCK_HEADER_SIZE);
-
-    if (store)
-      os.write(reinterpret_cast<const char *>(block.data()), want);
-    else
-      os.write(reinterpret_cast<const char *>(payload.data()), comp_size);
-    if (!os) return SZIP_ERR_IO;
-
-    remaining -= want;
+    const unsigned batch = (unsigned)std::min<uint64_t>(
+        nw, (remaining + block_size - 1) / block_size);
+    for (unsigned b = 0; b < batch; ++b) {
+      wants[b] = static_cast<uint32_t>(
+          std::min<uint64_t>(block_size, remaining));
+      raws[b].resize(wants[b]);
+      if (!is.read(reinterpret_cast<char *>(raws[b].data()), wants[b]))
+        return SZIP_ERR_IO;
+      remaining -= wants[b];
+    }
+    std::vector<uint8_t> ptype(nw, SZIP_BLOCK_SZLZRC);
+    parallel_for(batch, [&](uint32_t b) {
+      encode_block_auto(raws[b].data(), wants[b], pays[b], ptype[b]);
+    });
+    for (unsigned b = 0; b < batch; ++b) {
+      crc = szip_crc32_update(crc, raws[b].data(), wants[b]);
+      const bool store = pays[b].size() >= wants[b];
+      const uint32_t comp_size =
+          store ? wants[b] : static_cast<uint32_t>(pays[b].size());
+      write_compact_block(os, store ? SZIP_BLOCK_STORED : ptype[b],
+                          wants[b], comp_size);
+      if (store)
+        os.write(reinterpret_cast<const char *>(raws[b].data()), wants[b]);
+      else
+        os.write(reinterpret_cast<const char *>(pays[b].data()), comp_size);
+      if (!os) return SZIP_ERR_IO;
+    }
   }
 
   put_u32(os, crc);
-  char magic[4] = {SZIP_MAGIC0, SZIP_MAGIC1, SZIP_MAGIC2, SZIP_MAGIC3};
-  os.write(magic, 4);
   return os ? SZIP_OK : SZIP_ERR_IO;
 }
 
@@ -1345,12 +1595,14 @@ int compress_file(const std::string &in_path, const std::string &out_path,
 int compress_buffer(const uint8_t *data, size_t len,
                     std::vector<uint8_t> &out, uint32_t block_size) {
   if (block_size == 0 || block_size > (1u << 24)) return SZIP_ERR_FORMAT;
+  if (g_sprint && block_size > (256u << 10)) block_size = 256u << 10;
   if (len > (size_t)1 << 32) return SZIP_ERR_FORMAT;
   std::vector<uint8_t> payload;
   // Single-block bare/normal fast path (mirrors compress_file).
   if (len <= block_size) {
-    encode_block_szlzrc(data, static_cast<uint32_t>(len), payload);
-    if (payload.size() >= len) {
+    uint8_t btype = SZIP_BLOCK_SZLZRC;
+    encode_block_auto(data, static_cast<uint32_t>(len), payload, btype);
+    if (payload.size() + 11 >= len) {
       out.resize(4 + len);
       out[0] = SZIP_MAGIC0; out[1] = SZIP_MAGIC1; out[2] = SZIP_MAGIC2;
       out[3] = (uint8_t)(SZIP_BARE_FLAG | SZIP_VERSION);
@@ -1358,54 +1610,145 @@ int compress_buffer(const uint8_t *data, size_t len,
       return SZIP_OK;
     }
     std::ostringstream os(std::ios::binary);
-    if (!write_header(os, block_size, len)) return SZIP_ERR_IO;
-    char hdr[SZIP_BLOCK_HEADER_SIZE];
-    hdr[0] = SZIP_BLOCK_SZLZRC; hdr[1] = 0;
-    hdr[2] = (char)(len & 0xFF);        hdr[3] = (char)((len >> 8) & 0xFF);
-    hdr[4] = (char)((len >> 16) & 0xFF); hdr[5] = (char)((len >> 24) & 0xFF);
-    const uint32_t comp_size = (uint32_t)payload.size();
-    hdr[6] = (char)(comp_size & 0xFF);   hdr[7] = (char)((comp_size >> 8) & 0xFF);
-    hdr[8] = (char)((comp_size >> 16) & 0xFF);
-    hdr[9] = (char)((comp_size >> 24) & 0xFF);
-    os.write(hdr, SZIP_BLOCK_HEADER_SIZE);
-    os.write((const char *)payload.data(), comp_size);
+    write_compact_magic(os);
+    write_compact_block(os, btype, (uint32_t)len,
+                        (uint32_t)payload.size());
+    os.write((const char *)payload.data(), (std::streamsize)payload.size());
     put_u32(os, szip_crc32(data, len));
-    char magic[4] = {SZIP_MAGIC0, SZIP_MAGIC1, SZIP_MAGIC2, SZIP_MAGIC3};
-    os.write(magic, 4);
     const std::string &tmp = os.str();
     out.assign(tmp.begin(), tmp.end());
     return SZIP_OK;
   }
   std::ostringstream os(std::ios::binary);
-  if (!write_header(os, block_size, len)) return SZIP_ERR_IO;
+  write_compact_magic(os);
   uint32_t crc = 0;
   size_t off = 0;
+  const unsigned nw = sz_workers();
+  std::vector<std::vector<uint8_t>> pays(nw);
+  std::vector<const uint8_t *> blks(nw);
+  std::vector<uint32_t> wants(nw);
   while (off < len) {
-    const uint32_t want = static_cast<uint32_t>(
-        std::min<size_t>(block_size, len - off));
-    const uint8_t *blk = data + off;
-    crc = szip_crc32_update(crc, blk, want);
-    encode_block_szlzrc(blk, want, payload);
-    const bool store = payload.size() >= want;
-    const uint32_t comp_size = store ? want : (uint32_t)payload.size();
-    char hdr[SZIP_BLOCK_HEADER_SIZE];
-    hdr[0] = store ? SZIP_BLOCK_STORED : SZIP_BLOCK_SZLZRC;
-    hdr[1] = 0;
-    hdr[2] = (char)(want & 0xFF);        hdr[3] = (char)((want >> 8) & 0xFF);
-    hdr[4] = (char)((want >> 16) & 0xFF); hdr[5] = (char)((want >> 24) & 0xFF);
-    hdr[6] = (char)(comp_size & 0xFF);   hdr[7] = (char)((comp_size >> 8) & 0xFF);
-    hdr[8] = (char)((comp_size >> 16) & 0xFF);
-    hdr[9] = (char)((comp_size >> 24) & 0xFF);
-    os.write(hdr, SZIP_BLOCK_HEADER_SIZE);
-    if (store) os.write((const char *)blk, want);
-    else os.write((const char *)payload.data(), comp_size);
-    off += want;
+    const unsigned batch = (unsigned)std::min<size_t>(
+        nw, (len - off + block_size - 1) / block_size);
+    for (unsigned b = 0; b < batch; ++b) {
+      blks[b] = data + off;
+      wants[b] = static_cast<uint32_t>(
+          std::min<size_t>(block_size, len - off));
+      off += wants[b];
+    }
+    std::vector<uint8_t> ptype(nw, SZIP_BLOCK_SZLZRC);
+    parallel_for(batch, [&](uint32_t b) {
+      encode_block_auto(blks[b], wants[b], pays[b], ptype[b]);
+    });
+    for (unsigned b = 0; b < batch; ++b) {
+      crc = szip_crc32_update(crc, blks[b], wants[b]);
+      const bool store = pays[b].size() >= wants[b];
+      const uint32_t comp_size =
+          store ? wants[b] : static_cast<uint32_t>(pays[b].size());
+      write_compact_block(os, store ? SZIP_BLOCK_STORED : ptype[b],
+                          wants[b], comp_size);
+      if (store) os.write((const char *)blks[b], wants[b]);
+      else os.write((const char *)pays[b].data(), comp_size);
+    }
   }
   put_u32(os, crc);
-  char magic[4] = {SZIP_MAGIC0, SZIP_MAGIC1, SZIP_MAGIC2, SZIP_MAGIC3};
-  os.write(magic, 4);
   const std::string &tmp = os.str(); // ostringstream::str() returns a copy
   out.assign(tmp.begin(), tmp.end());
+  return SZIP_OK;
+}
+
+// Walk a compact-v7 block stream (caller has consumed the 4-byte magic; pos
+// accounting starts at 4).  Blocks: [type u8][raw u24][comp u24] + payload,
+// until exactly the trailing 4-byte CRC32 remains.  sink_vec / sink_os
+// receive decoded bytes; both null = validate only.  Hostile-input safe.
+int walk_blocks_v7(std::istream &is, uint64_t stream_len,
+                   std::vector<uint8_t> *sink_vec, std::ostream *sink_os,
+                   uint32_t *crc_out, uint64_t *produced_out) {
+  uint32_t crcc = 0;
+  uint64_t produced = 0;
+  uint64_t pos = 4;
+  const unsigned nw = sz_workers();
+  // Groups of blocks are read sequentially, decoded in parallel, and
+  // emitted in order — byte-identical to the serial walk.
+  struct Blk {
+    uint8_t type;
+    uint32_t raw_size, comp_size;
+    std::vector<uint8_t> payload;
+  };
+  while (pos + 4 < stream_len) {
+    std::vector<Blk> group;
+    group.reserve(nw);
+    while (group.size() < nw && pos + 4 < stream_len) {
+      unsigned char bh[SZIP_V7_BLOCK_HEADER_SIZE];
+      if (!is.read(reinterpret_cast<char *>(bh), SZIP_V7_BLOCK_HEADER_SIZE))
+        return SZIP_ERR_TRUNCATED;
+      pos += SZIP_V7_BLOCK_HEADER_SIZE;
+      Blk b;
+      b.type = bh[0];
+      b.raw_size = (uint32_t)bh[1] | ((uint32_t)bh[2] << 8) |
+                   ((uint32_t)bh[3] << 16);
+      b.comp_size = (uint32_t)bh[4] | ((uint32_t)bh[5] << 8) |
+                    ((uint32_t)bh[6] << 16);
+      if (b.raw_size == 0 || b.comp_size == 0) return SZIP_ERR_CORRUPT;
+      if (pos + (uint64_t)b.comp_size + 4 > stream_len) return SZIP_ERR_CORRUPT;
+      if (b.type == SZIP_BLOCK_STORED) {
+        if (b.comp_size != b.raw_size) return SZIP_ERR_CORRUPT;
+      } else if (b.type == SZIP_BLOCK_SZLZRC) {
+        if (b.comp_size < 5) return SZIP_ERR_CORRUPT;
+      } else if (b.type == SZIP_BLOCK_SPRINT) {
+        if (b.comp_size < 1) return SZIP_ERR_CORRUPT;
+      } else {
+        return SZIP_ERR_UNSUPPORTED;
+      }
+      b.payload.resize(b.comp_size);
+      if (!is.read(reinterpret_cast<char *>(b.payload.data()), b.comp_size))
+        return SZIP_ERR_TRUNCATED;
+      pos += b.comp_size;
+      group.push_back(std::move(b));
+    }
+    std::vector<std::vector<uint8_t>> raws(group.size());
+    std::vector<int> errs(group.size(), 0);
+    std::vector<std::thread> ths;
+    for (size_t gi = 0; gi < group.size(); ++gi) {
+      if (group[gi].type == SZIP_BLOCK_STORED) continue;
+      ths.emplace_back([&, gi] {
+        raws[gi].resize(group[gi].raw_size);
+        if (group[gi].type == SZIP_BLOCK_SPRINT)
+          errs[gi] = sprint::decompress(group[gi].payload.data(),
+                                        group[gi].comp_size, raws[gi].data(),
+                                        group[gi].raw_size) == 0
+                         ? SZIP_OK
+                         : SZIP_ERR_CORRUPT;
+        else
+          errs[gi] = decode_block_szlzrc(group[gi].payload.data(),
+                                         group[gi].comp_size, raws[gi].data(),
+                                         group[gi].raw_size);
+      });
+    }
+    for (auto &t : ths) t.join();
+    for (size_t gi = 0; gi < group.size(); ++gi) {
+      const Blk &b = group[gi];
+      const uint8_t *raw;
+      if (b.type == SZIP_BLOCK_STORED) {
+        raw = b.payload.data();
+      } else {
+        if (errs[gi] != SZIP_OK) return errs[gi];
+        raw = raws[gi].data();
+      }
+      crcc = szip_crc32_update(crcc, raw, b.raw_size);
+      if (sink_vec) sink_vec->insert(sink_vec->end(), raw, raw + b.raw_size);
+      if (sink_os &&
+          !sink_os->write(reinterpret_cast<const char *>(raw), b.raw_size))
+        return SZIP_ERR_IO;
+      produced += b.raw_size;
+    }
+  }
+  if (pos + 4 != stream_len) return SZIP_ERR_CORRUPT;
+  uint32_t stored_crc = 0;
+  if (!get_u32(is, &stored_crc)) return SZIP_ERR_TRUNCATED;
+  if (stored_crc != crcc) return SZIP_ERR_CORRUPT;
+  if (crc_out) *crc_out = crcc;
+  if (produced_out) *produced_out = produced;
   return SZIP_OK;
 }
 
@@ -1420,6 +1763,11 @@ int decompress_buffer(const uint8_t *data, size_t len,
     return SZIP_OK;
   }
   std::istringstream is(std::string((const char *)data, len), std::ios::binary);
+  if (is_compact_magic(m)) {
+    if ((m[3] & 0x3F) > SZIP_VERSION) return SZIP_ERR_UNSUPPORTED;
+    is.seekg(4);
+    return walk_blocks_v7(is, len, &out, nullptr, nullptr, nullptr);
+  }
   uint32_t block_size = 0;
   uint64_t total = 0;
   int e = read_and_check_header(is, &block_size, &total);
@@ -1479,6 +1827,21 @@ int decompress_file(const std::string &in_path, const std::string &out_path,
     }
     if (raw_out) *raw_out = produced;
     if (crc_out) *crc_out = 0; // bare form stores data verbatim (no checksum)
+    return os ? SZIP_OK : SZIP_ERR_IO;
+  }
+  if (is_compact_magic(magic)) {
+    if ((magic[3] & 0x3F) > SZIP_VERSION) return SZIP_ERR_UNSUPPORTED;
+    is.seekg(0, std::ios::end);
+    const uint64_t flen = (uint64_t)is.tellg();
+    is.seekg(4);
+    std::ofstream os(out_path, std::ios::binary | std::ios::trunc);
+    if (!os) return SZIP_ERR_IO;
+    uint32_t crc = 0;
+    uint64_t produced = 0;
+    const int we = walk_blocks_v7(is, flen, nullptr, &os, &crc, &produced);
+    if (we != SZIP_OK) return we;
+    if (raw_out) *raw_out = produced;
+    if (crc_out) *crc_out = crc;
     return os ? SZIP_OK : SZIP_ERR_IO;
   }
   is.seekg(0);
@@ -1557,6 +1920,17 @@ int test_file(const std::string &in_path, uint64_t *raw_out) {
     const uint64_t produced = (uint64_t)is.tellg() - 4;
     if (raw_out) *raw_out = produced;
     return SZIP_OK; // verbatim storage: nothing further to validate
+  }
+  if (is_compact_magic(magic)) {
+    if ((magic[3] & 0x3F) > SZIP_VERSION) return SZIP_ERR_UNSUPPORTED;
+    is.seekg(0, std::ios::end);
+    const uint64_t flen = (uint64_t)is.tellg();
+    is.seekg(4);
+    uint64_t produced = 0;
+    const int we = walk_blocks_v7(is, flen, nullptr, nullptr, nullptr, &produced);
+    if (we != SZIP_OK) return we;
+    if (raw_out) *raw_out = produced;
+    return SZIP_OK;
   }
   is.seekg(0);
 
@@ -1649,6 +2023,36 @@ int szip_decompress_block(const uint8_t *src, size_t src_len, uint8_t *dst,
   if (raw_len > (1u << 24)) return SZIP_ERR_FORMAT;
   return szip::decode_block_szlzrc(src, src_len, dst,
                                    static_cast<uint32_t>(raw_len));
+}
+
+int szip_compress_block_sprint(const uint8_t *src, size_t src_len, uint8_t *dst,
+                               size_t dst_cap, size_t *dst_len) {
+  if (!dst_len) return SZIP_ERR_FORMAT;
+  if (src_len == 0) {
+    *dst_len = 0;
+    return SZIP_OK;
+  }
+  if (src_len > (1u << 24)) return SZIP_ERR_FORMAT;
+  try {
+    std::vector<uint8_t> payload;
+    szip::sprint::compress(src, static_cast<uint32_t>(src_len), payload);
+    if (payload.size() > dst_cap) return SZIP_ERR_BUFFER;
+    std::memcpy(dst, payload.data(), payload.size());
+    *dst_len = payload.size();
+    return SZIP_OK;
+  } catch (...) {
+    return SZIP_ERR_NOMEM;
+  }
+}
+
+int szip_decompress_block_sprint(const uint8_t *src, size_t src_len,
+                                 uint8_t *dst, size_t raw_len) {
+  if (raw_len == 0) return SZIP_OK;
+  if (raw_len > (1u << 24)) return SZIP_ERR_FORMAT;
+  return szip::sprint::decompress(src, static_cast<uint32_t>(src_len), dst,
+                                  static_cast<uint32_t>(raw_len)) == 0
+             ? SZIP_OK
+             : SZIP_ERR_CORRUPT;
 }
 
 uint32_t szip_crc32_update(uint32_t crc, const uint8_t *data, size_t len) {

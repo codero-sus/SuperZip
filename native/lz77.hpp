@@ -3,7 +3,7 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "szip.h"
@@ -30,8 +30,34 @@ struct Match {
   uint32_t off = 0; // 1-based
 };
 
+// Word-at-a-time match extension: returns the number of equal bytes at
+// a/b before a mismatch, capped at max_len.  Identical result to the
+// byte-by-byte loop, 4-8x faster on long matches.
+inline uint32_t match_len(const uint8_t *a, const uint8_t *b, uint32_t max_len) {
+  uint32_t len = 0;
+  while (len + 8 <= max_len) {
+    uint64_t x, y;
+    std::memcpy(&x, a + len, 8);
+    std::memcpy(&y, b + len, 8);
+    if (x != y) {
+      for (uint32_t k = 0; k < 8; ++k)
+        if (a[len + k] != b[len + k]) return len + k;
+    }
+    len += 8;
+  }
+  while (len < max_len && a[len] == b[len]) ++len;
+  return len;
+}
+
 class MatchFinder {
 public:
+  static uint32_t hash3(const uint8_t *p) {
+    const uint32_t v = static_cast<uint32_t>(p[0]) |
+                       (static_cast<uint32_t>(p[1]) << 8) |
+                       (static_cast<uint32_t>(p[2]) << 16);
+    return (v * 2654435761u) >> (32 - kHashBits);
+  }
+
   // prev_ is indexed modulo the block size; call prepare() once per block.
   void prepare(uint32_t block_len) {
     head_.assign(kHashSize, 0);
@@ -60,19 +86,18 @@ public:
       if (mpos < limit) break;
       if (mpos >= pos) {
         // current position (or lazy look-ahead) is in the chain: skip it
-        cand = prev_[mpos % prev_.size()];
+        cand = prev_[mpos];
         continue;
       }
 
       // cheap reject: first 3 bytes must match
       if (data[mpos] != data[pos] || data[mpos + 1] != data[pos + 1] ||
           data[mpos + 2] != data[pos + 2]) {
-        cand = prev_[mpos % prev_.size()];
+        cand = prev_[mpos];
         continue;
       }
 
-      uint32_t len = 3;
-      while (len < max_len && data[mpos + len] == data[pos + len]) ++len;
+      uint32_t len = 3 + match_len(data + mpos + 3, data + pos + 3, max_len - 3);
 
       // price-aware: prefer longer matches, but a much nearer match can win
       const uint32_t off = pos - mpos;
@@ -85,7 +110,7 @@ public:
         best_score = score;
       }
       if (len >= kNiceLen || len == max_len) break;
-      cand = prev_[mpos % prev_.size()];
+      cand = prev_[mpos];
     }
     return best;
   }
@@ -95,6 +120,31 @@ public:
   // find() exactly. Also force-includes the longest and nearest matches.
   uint32_t find_multi(const uint8_t *data, uint32_t n, uint32_t pos,
                       Match *out, uint32_t kmax) const {
+    return find_multi_walk(data, n, pos, head_[hash3(data + pos)], out, kmax,
+                           [&](uint32_t mpos) { return prev_[mpos]; });
+  }
+
+  // Same walk driven by an explicit link chain (link1[p] = previous
+  // same-hash position + 1, 0 = none).  Used by the parallel candidate
+  // cache build: the link pass is sequential and cheap, the walk/verify
+  // phase is per-position independent.  Semantics are identical to
+  // find_multi with the self entry at the head of the chain.
+  uint32_t find_multi_link(const uint8_t *data, uint32_t n, uint32_t pos,
+                           const uint32_t *link1, Match *out,
+                           uint32_t kmax,
+                           uint32_t chain = SZ_CHAIN,
+                           uint32_t nice = SZ_NICE) const {
+    return find_multi_walk(data, n, pos, pos + 1, out, kmax,
+                           [&](uint32_t mpos) { return link1[mpos]; },
+                           chain, nice);
+  }
+
+  template <class NextFn>
+  uint32_t find_multi_walk(const uint8_t *data, uint32_t n, uint32_t pos,
+                           uint32_t first, Match *out, uint32_t kmax,
+                           NextFn next_of,
+                           uint32_t chain_cap = SZ_CHAIN,
+                           uint32_t nice = SZ_NICE) const {
     if (pos + kMinMatch > n) return 0;
     const uint32_t max_len = std::min<uint32_t>(kMaxMatch, n - pos);
     const uint32_t limit = (pos > kWindow) ? pos - kWindow : 0;
@@ -104,21 +154,20 @@ public:
     uint32_t cnt = 0;
     uint32_t longest_i = 0, nearest_i = 0;
 
-    uint32_t cand = head_[hash3(data + pos)];
-    for (uint32_t depth = 0; depth < kMaxChain && cand != 0; ++depth) {
+    uint32_t cand = first;
+    for (uint32_t depth = 0; depth < chain_cap && cand != 0; ++depth) {
       const uint32_t mpos = cand - 1;
       if (mpos < limit) break;
       if (mpos >= pos) {
-        cand = prev_[mpos % prev_.size()];
+        cand = next_of(mpos);
         continue;
       }
       if (data[mpos] != data[pos] || data[mpos + 1] != data[pos + 1] ||
           data[mpos + 2] != data[pos + 2]) {
-        cand = prev_[mpos % prev_.size()];
+        cand = next_of(mpos);
         continue;
       }
-      uint32_t len = 3;
-      while (len < max_len && data[mpos + len] == data[pos + len]) ++len;
+      uint32_t len = 3 + match_len(data + mpos + 3, data + pos + 3, max_len - 3);
       const uint32_t off = pos - mpos;
       uint32_t bl = 0;
       for (uint32_t t = off; t; t >>= 1) ++bl;
@@ -129,8 +178,8 @@ public:
       if (off < all[nearest_i].off) nearest_i = cnt;
       ++cnt;
       if (len == max_len && cnt >= 4) break; // full-length: diversity is done
-      if (len >= kNiceLen && cnt >= kmax) break;
-      cand = prev_[mpos % prev_.size()];
+      if (len >= nice && cnt >= kmax) break;
+      cand = next_of(mpos);
     }
     if (cnt == 0) return 0;
 
@@ -165,13 +214,6 @@ public:
   }
 
 private:
-  static uint32_t hash3(const uint8_t *p) {
-    const uint32_t v = static_cast<uint32_t>(p[0]) |
-                       (static_cast<uint32_t>(p[1]) << 8) |
-                       (static_cast<uint32_t>(p[2]) << 16);
-    return (v * 2654435761u) >> (32 - kHashBits);
-  }
-
   std::vector<uint32_t> head_;
   std::vector<uint32_t> prev_;
 };

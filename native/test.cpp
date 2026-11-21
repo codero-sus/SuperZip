@@ -218,7 +218,7 @@ static void test_container() {
     write_file(in, data);
     CHECK(szip::compress_file(in, arc, 4096) == SZIP_OK);
     auto bytes = read_file(arc);
-    bytes[bytes.size() - 5] ^= 0xFF; // smash CRC
+    bytes[bytes.size() - 1] ^= 0xFF; // smash CRC (v7: last 4 bytes)
     write_file(arc, bytes);
     CHECK(szip::decompress_file(arc, tmp_path("out.bin"), nullptr, nullptr) ==
           SZIP_ERR_CORRUPT);
