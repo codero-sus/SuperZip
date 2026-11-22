@@ -172,7 +172,9 @@ struct Hist {
   uint8_t b[5] = {0, 0, 0, 0, 0};
   uint8_t wpos = 0; // bytes since last space, clamped to 7
   uint8_t bns = 0;  // last non-whitespace byte
+  uint8_t ph = 0;   // block position mod 8 (record phase)
   void push(uint8_t v) {
+    ph = (uint8_t)((ph + 1) & 7);
     b[4] = b[3];
     b[3] = b[2];
     b[2] = b[1];
@@ -205,8 +207,8 @@ constexpr uint32_t kWCtx = SZ_WSTATE ? 256u : (uint32_t)SZ_WCTX;
 #endif
 
 struct MixLit {
-  std::vector<Prob, PoolAlloc<Prob>> t[6];
-  int32_t w[kWCtx][6];
+  std::vector<Prob, PoolAlloc<Prob>> t[7];
+  int32_t w[kWCtx][7];
   uint32_t gap_mode = 0;
   int32_t ts_ = SZ_TREESHIFT;
   int32_t wsh_ = SZ_WSHIFT;
@@ -234,8 +236,9 @@ struct MixLit {
     { const size_t nn = (size_t)r3 * 256; t[3].resize(nn); szip_fill16(t[3].data(), nn, (uint16_t)kProbInit); }
     if (SZ_ORDER5 && r4) { const size_t nn = (size_t)r4 * 256; t[4].resize(nn); szip_fill16(t[4].data(), nn, (uint16_t)kProbInit); }
     { const size_t nn = (size_t)r5 * 256; t[5].resize(nn); szip_fill16(t[5].data(), nn, (uint16_t)kProbInit); } // (wpos, prev, pprev>>3) word shape
+    { const size_t nn = (size_t)64 * 256; t[6].resize(nn); szip_fill16(t[6].data(), nn, (uint16_t)kProbInit); } // record phase x prev band
     for (auto &row : w)
-      for (auto &x : row) x = (1 << kWShift) / 6; // start as equal mix
+      for (auto &x : row) x = (1 << kWShift) / 7; // start as equal mix
   }
 
 #ifndef SZ_WCTX_WPOS
@@ -289,13 +292,16 @@ struct MixLit {
 
   // p0 = P(bit == 0) in [1, 2047]
   uint32_t mix(uint32_t wk, const Prob *n0, const Prob *n1, const Prob *n2,
-               const Prob *n3, const Prob *n4, const Prob *n5) const {
+               const Prob *n3, const Prob *n4, const Prob *n5,
+               const Prob *n6) const {
     const int64_t x0 = kStretch[*n0], x1 = kStretch[*n1];
     const int64_t x2 = kStretch[*n2], x3 = kStretch[*n3];
     const int64_t x4 = n4 ? kStretch[*n4] : 0;
     const int64_t x5 = kStretch[*n5];
+    const int64_t x6 = kStretch[*n6];
     int64_t x = (w[wk][0] * x0 + w[wk][1] * x1 + w[wk][2] * x2 +
-                 w[wk][3] * x3 + w[wk][4] * x4 + w[wk][5] * x5) >>
+                 w[wk][3] * x3 + w[wk][4] * x4 + w[wk][5] * x5 +
+                 w[wk][6] * x6) >>
                 kWShift;
     if (x > SZIP_SQUASH_BIAS) x = SZIP_SQUASH_BIAS;
     if (x < -SZIP_SQUASH_BIAS) x = -SZIP_SQUASH_BIAS;
@@ -303,7 +309,7 @@ struct MixLit {
   }
 
   void train(uint32_t wk, Prob *n0, Prob *n1, Prob *n2, Prob *n3, Prob *n4,
-             Prob *n5, uint32_t bit, uint32_t p) {
+             Prob *n5, Prob *n6, uint32_t bit, uint32_t p) {
     if (bit == 0) {
       *n0 = (Prob)(*n0 + ((2048 - *n0) >> ts_));
       *n1 = (Prob)(*n1 + ((2048 - *n1) >> ts_));
@@ -311,6 +317,7 @@ struct MixLit {
       *n3 = (Prob)(*n3 + ((2048 - *n3) >> ts_));
       if (n4) *n4 = (Prob)(*n4 + ((2048 - *n4) >> ts_));
       *n5 = (Prob)(*n5 + ((2048 - *n5) >> ts_));
+      *n6 = (Prob)(*n6 + ((2048 - *n6) >> ts_));
     } else {
       *n0 = (Prob)(*n0 - (*n0 >> ts_));
       *n1 = (Prob)(*n1 - (*n1 >> ts_));
@@ -318,12 +325,13 @@ struct MixLit {
       *n3 = (Prob)(*n3 - (*n3 >> ts_));
       if (n4) *n4 = (Prob)(*n4 - (*n4 >> ts_));
       *n5 = (Prob)(*n5 - (*n5 >> ts_));
+      *n6 = (Prob)(*n6 - (*n6 >> ts_));
     }
     const int32_t err = (int32_t)(bit == 0 ? 2048 - p : 0 - p);
-    const int64_t xs[6] = {kStretch[*n0], kStretch[*n1], kStretch[*n2],
+    const int64_t xs[7] = {kStretch[*n0], kStretch[*n1], kStretch[*n2],
                            kStretch[*n3], n4 ? kStretch[*n4] : 0,
-                           kStretch[*n5]};
-    for (int i = 0; i < 6; ++i) {
+                           kStretch[*n5], kStretch[*n6]};
+    for (int i = 0; i < 7; ++i) {
       int32_t nw = w[wk][i] + (int32_t)((err * xs[i]) >> esh_);
       if (nw > kWClamp) nw = kWClamp;
       if (nw < -kWClamp) nw = -kWClamp;
@@ -340,6 +348,7 @@ struct MixLit {
     const uint32_t c3 = h4(h.b[0], h.b[1], h.b[2], h.b[3], h.wpos);
     const uint32_t c5 = SZ_ORDER5 ? h5(h.b[0], h.b[1], h.b[2], h.b[3], h.b[4], h.wpos) : 0;
     const uint32_t cw = hw(h, mb);
+    const uint32_t c6 = (((uint32_t)h.ph & 7u) << 3) | ((uint32_t)h.b[0] >> 5);
     uint32_t sym = 1;
     for (int k = 7; k >= 0; --k) {
       const uint32_t bit = (b >> k) & 1;
@@ -347,9 +356,10 @@ struct MixLit {
       Prob *n2 = &t[2][(c2 & m2_) * 256 + sym], *n3 = &t[3][(c3 & m3_) * 256 + sym];
       Prob *n4 = (SZ_ORDER5 && !light_ && !(gap_mode && SZ_NO5_B)) ? &t[4][(c5 & m4_) * 256 + sym] : nullptr;
       Prob *n5 = &t[5][(cw & m5_) * 256 + sym];
+      Prob *n6 = &t[6][c6 * 256 + sym];
       const uint32_t wk = wctx((uint32_t)(7 - k), h, st);
-      const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5);
-      train(wk, n0, n1, n2, n3, n4, n5, bit, p);
+      const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5, n6);
+      train(wk, n0, n1, n2, n3, n4, n5, n6, bit, p);
       sym = (sym << 1) | bit;
     }
     h.push(b);
@@ -362,6 +372,7 @@ struct MixLit {
     const uint32_t c3 = h4(h.b[0], h.b[1], h.b[2], h.b[3], h.wpos);
     const uint32_t c5 = SZ_ORDER5 ? h5(h.b[0], h.b[1], h.b[2], h.b[3], h.b[4], h.wpos) : 0;
     const uint32_t cw = hw(h, mb);
+    const uint32_t c6 = (((uint32_t)h.ph & 7u) << 3) | ((uint32_t)h.b[0] >> 5);
     uint32_t sym = 1;
     for (int k = 7; k >= 0; --k) {
       const uint32_t bit = (b >> k) & 1;
@@ -369,13 +380,14 @@ struct MixLit {
       Prob *n2 = &t[2][(c2 & m2_) * 256 + sym], *n3 = &t[3][(c3 & m3_) * 256 + sym];
       Prob *n4 = (SZ_ORDER5 && !light_ && !(gap_mode && SZ_NO5_B)) ? &t[4][(c5 & m4_) * 256 + sym] : nullptr;
       Prob *n5 = &t[5][(cw & m5_) * 256 + sym];
+      Prob *n6 = &t[6][c6 * 256 + sym];
       const uint32_t wk = wctx((uint32_t)(7 - k), h, st);
-      const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5);
+      const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5, n6);
 #if SZ_STATS
       g_enc_price_sum += (double)kBitPrice[bit == 0 ? p : 2048 - p];
 #endif
       rc.encode_bit_p(p, bit);
-      train(wk, n0, n1, n2, n3, n4, n5, bit, p);
+      train(wk, n0, n1, n2, n3, n4, n5, n6, bit, p);
       sym = (sym << 1) | bit;
     }
     h.push(b);
@@ -388,16 +400,18 @@ struct MixLit {
     const uint32_t c3 = h4(h.b[0], h.b[1], h.b[2], h.b[3], h.wpos);
     const uint32_t c5 = SZ_ORDER5 ? h5(h.b[0], h.b[1], h.b[2], h.b[3], h.b[4], h.wpos) : 0;
     const uint32_t cw = hw(h, mb);
+    const uint32_t c6 = (((uint32_t)h.ph & 7u) << 3) | ((uint32_t)h.b[0] >> 5);
     uint32_t sym = 1;
     for (int k = 0; k < 8; ++k) {
       Prob *n0 = &t[0][c0 * 256 + sym], *n1 = &t[1][(c1 & m1_) * 256 + sym];
       Prob *n2 = &t[2][(c2 & m2_) * 256 + sym], *n3 = &t[3][(c3 & m3_) * 256 + sym];
       Prob *n4 = (SZ_ORDER5 && !light_ && !(gap_mode && SZ_NO5_B)) ? &t[4][(c5 & m4_) * 256 + sym] : nullptr;
       Prob *n5 = &t[5][(cw & m5_) * 256 + sym];
+      Prob *n6 = &t[6][c6 * 256 + sym];
       const uint32_t wk = wctx((uint32_t)k, h, st);
-      const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5);
+      const uint32_t p = mix(wk, n0, n1, n2, n3, n4, n5, n6);
       const uint32_t bit = rc.decode_bit_p(p);
-      train(wk, n0, n1, n2, n3, n4, n5, bit, p);
+      train(wk, n0, n1, n2, n3, n4, n5, n6, bit, p);
       sym = (sym << 1) | bit;
     }
     return (uint8_t)(sym & 0xFFu);
@@ -415,22 +429,23 @@ struct MixLit {
     const uint32_t c3 = h4(h.b[0], h.b[1], h.b[2], h.b[3], h.wpos);
     const uint32_t c5 = SZ_ORDER5 ? h5(h.b[0], h.b[1], h.b[2], h.b[3], h.b[4], h.wpos) : 0;
     const uint32_t cw = hw(h, mb);
+    const uint32_t c6 = (((uint32_t)h.ph & 7u) << 3) | ((uint32_t)h.b[0] >> 5);
 
-    Prob n[8][6];
-    int32_t wl[8][6];
+    Prob n[8][7];
+    int32_t wl[8][7];
     uint32_t wks[8];
     uint32_t sym = 1;
     for (int k = 7; k >= 0; --k) {
       const int step = 7 - k;
-      const Prob *srcs[6] = {
+      const Prob *srcs[7] = {
           &t[0][c0 * 256 + sym], &t[1][(c1 & m1_) * 256 + sym],
           &t[2][(c2 & m2_) * 256 + sym], &t[3][(c3 & m3_) * 256 + sym],
           (SZ_ORDER5 && !light_ && !(gap_mode && SZ_NO5_B)) ? &t[4][(c5 & m4_) * 256 + sym]
                                                  : nullptr,
-          &t[5][(cw & m5_) * 256 + sym]};
-      for (int j = 0; j < 6; ++j) n[step][j] = srcs[j] ? *srcs[j] : (Prob)0;
+          &t[5][(cw & m5_) * 256 + sym], &t[6][c6 * 256 + sym]};
+      for (int j = 0; j < 7; ++j) n[step][j] = srcs[j] ? *srcs[j] : (Prob)0;
       wks[step] = wctx((uint32_t)(7 - k), h, st);
-      for (int j = 0; j < 6; ++j) wl[step][j] = w[wks[step]][j];
+      for (int j = 0; j < 7; ++j) wl[step][j] = w[wks[step]][j];
       sym = (sym << 1) | ((b >> k) & 1u);
     }
 
@@ -440,13 +455,16 @@ struct MixLit {
       const uint32_t bit = (b >> k) & 1;
       Prob *n0 = &n[step][0], *n1 = &n[step][1], *n2 = &n[step][2];
       Prob *n3 = &n[step][3], *n4 = &n[step][4], *n5 = &n[step][5];
+      Prob *n6 = &n[step][6];
       const int32_t x0 = kStretch[*n0], x1 = kStretch[*n1];
       const int32_t x2 = kStretch[*n2], x3 = kStretch[*n3];
       const int32_t x4 = n4 ? kStretch[*n4] : 0;
       const int32_t x5 = kStretch[*n5];
+      const int32_t x6 = kStretch[*n6];
       int32_t x = (int32_t)((wl[step][0] * (int64_t)x0 + wl[step][1] * (int64_t)x1 +
                              wl[step][2] * (int64_t)x2 + wl[step][3] * (int64_t)x3 +
-                             wl[step][4] * (int64_t)x4 + wl[step][5] * (int64_t)x5) >>
+                             wl[step][4] * (int64_t)x4 + wl[step][5] * (int64_t)x5 +
+                             wl[step][6] * (int64_t)x6) >>
                             kWShift);
       if (x > SZIP_SQUASH_BIAS) x = SZIP_SQUASH_BIAS;
       if (x < -SZIP_SQUASH_BIAS) x = -SZIP_SQUASH_BIAS;
@@ -454,20 +472,20 @@ struct MixLit {
       price += kBitPrice[bit == 0 ? p : 2048 - p];
       // train the local copies exactly like train() does
       if (bit == 0) {
-        for (int j = 0; j < 6; ++j)
+        for (int j = 0; j < 7; ++j)
           if (j != 4 || n4)
             n[step][j] = (Prob)(n[step][j] + ((2048 - n[step][j]) >> ts_));
       } else {
-        for (int j = 0; j < 6; ++j)
+        for (int j = 0; j < 7; ++j)
           if (j != 4 || n4)
             n[step][j] = (Prob)(n[step][j] - (n[step][j] >> ts_));
       }
       const int32_t err = (int32_t)(bit == 0 ? 2048 - p : 0 - p);
-      const int32_t xs[6] = {kStretch[n[step][0]], kStretch[n[step][1]],
+      const int32_t xs[7] = {kStretch[n[step][0]], kStretch[n[step][1]],
                              kStretch[n[step][2]], kStretch[n[step][3]],
                              n4 ? kStretch[n[step][4]] : 0,
-                             kStretch[n[step][5]]};
-      for (int j = 0; j < 6; ++j) {
+                             kStretch[n[step][5]], kStretch[n[step][6]]};
+      for (int j = 0; j < 7; ++j) {
         int32_t nw = wl[step][j] + (int32_t)((err * (int64_t)xs[j]) >> esh_);
         if (nw > kWClamp) nw = kWClamp;
         if (nw < -kWClamp) nw = -kWClamp;

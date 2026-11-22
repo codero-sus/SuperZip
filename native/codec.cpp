@@ -941,7 +941,7 @@ static void emit_plan(const uint8_t *src, uint32_t n,
                       std::vector<uint8_t> &out, uint32_t mode) {
   (void)n;
   RcEncoder rc(out);
-  Model m(mode >= 2 ? 2u : 0u);
+  Model m((mode & 7u) >= 2 ? 2u : 0u);
   MixLit mix(mode & 1u);
   Hist hist;
   uint32_t pos = 0;
@@ -1085,8 +1085,8 @@ static void encode_one_mode(const uint8_t *src, uint32_t n, uint32_t mode,
 // Escalating effort (self-tuning min-of-all): cheap candidates first — the
 // four fast-parse modes and the BWT/delta family — then the deep-parse
 // modes only when they could still matter (within 2% of the cheap best).
-void encode_block_szlzrc(const uint8_t *src, uint32_t n,
-                         std::vector<uint8_t> &out) {
+static void encode_szlzrc_core(const uint8_t *src, uint32_t n,
+                            std::vector<uint8_t> &out) {
   out.clear();
   if (n == 0) return;
   // Incompressible pre-reject (hyper/fast tiers): when the byte entropy is
@@ -1202,6 +1202,17 @@ void encode_block_szlzrc(const uint8_t *src, uint32_t n,
   // this function — join it now)
   bwt_thread.join();
   SZ_TOC(tbw, "bwt family (overlapped)");
+  // delta stream through the LZ/mixer family too (record data: doubles, ELF
+  // words, pcm — aligned deltas are sparse and the phase model codes them).
+  std::vector<uint8_t> cand_delta;
+  if (best_delta) {
+    std::vector<uint8_t> dtmp(n);
+    const uint32_t dlt = (best_delta == 1) ? 1u : (best_delta == 2) ? 2u
+                         : (best_delta == 3) ? 4u : 8u;
+    for (uint32_t i = 0; i < n; ++i)
+      dtmp[i] = (uint8_t)(src[i] - (i >= dlt ? src[i - dlt] : 0));
+    encode_szlzrc_core(dtmp.data(), n, cand_delta);
+  }
   // Phase 2 (deep parse): run the expensive modes only when they could
   // still beat the cheap best (the deep parse historically buys ~0-0.5%).
   // Skip the deep wave when the cheap parse already dominates: BWT does not
@@ -1233,9 +1244,19 @@ void encode_block_szlzrc(const uint8_t *src, uint32_t n,
     for (uint32_t k = 0; k < 4; ++k)
       if ((g_modeset & (1 << k)) && (best == UINT32_MAX || cand[k].size() < cand[best].size())) best = k;
   }
-  if (best_bwt.size() < cand[best].size()) {
+  const bool dlz_ok = !cand_delta.empty() && cand_delta[0] <= 3;
+  const size_t dlz_size = dlz_ok ? cand_delta.size() - 1 : (size_t)-1;
+  if (best_bwt.size() < cand[best].size() &&
+      best_bwt.size() <= dlz_size + (dlz_ok ? 1u : 0u)) {
     out.push_back((uint8_t)((best_delta << 3) | 4u));
     out.insert(out.end(), best_bwt.begin(), best_bwt.end());
+    return;
+  }
+  if (dlz_ok && dlz_size < cand[best].size()) {
+    // cand_delta = [inner mode byte][rANS payload]; the outer byte carries
+    // delta_id + the inner mode so the decoder finds both.
+    out.push_back((uint8_t)((best_delta << 3) | (cand_delta[0] & 7u)));
+    out.insert(out.end(), cand_delta.begin() + 1, cand_delta.end());
     return;
   }
   out.push_back((uint8_t)best); // mode byte: (regime << 1) | mixer
@@ -1243,10 +1264,153 @@ void encode_block_szlzrc(const uint8_t *src, uint32_t n,
 
 }
 
+// ---- column transform (SZLZRC v6.1): delimiter-aligned columnar text is
+// split into per-column streams and each is encoded independently.  Word
+// columns collapse; numeric columns stay near entropy.  Chosen only when the
+// total is smaller, so every other shape is untouched.
+static bool detect_columns(const uint8_t *src, uint32_t n, uint8_t *delim_out,
+                           uint32_t *ncols_out, uint32_t *body_out) {
+  if (n < 2048 || n > (1u << 24)) return false;
+  // trailing bytes after the last '\n' are stored raw as a tail
+  uint32_t body = n;
+  while (body > 0 && src[body - 1] != '\n') --body;
+  if (body < 1024) return false;
+  static const uint8_t kDelims[2] = {'\t', ','};
+  for (uint8_t d : kDelims) {
+    uint32_t K = 0, lines = 0, cnt = 0;
+    bool ok = true;
+    for (uint32_t i = 0; i < body; ++i) {
+      if (src[i] == d) ++cnt;
+      else if (src[i] == '\n') {
+        if (lines == 0) {
+          K = cnt;
+          if (K < 1 || K > 8) { ok = false; break; }
+        } else if (cnt != K) { ok = false; break; }
+        cnt = 0;
+        if (++lines > 4000000u) { ok = false; break; }
+      }
+    }
+    if (ok && lines >= 32) {
+      *delim_out = d;
+      *ncols_out = K + 1;
+      *body_out = body;
+      return true;
+    }
+  }
+  return false;
+}
+
+void encode_block_szlzrc(const uint8_t *src, uint32_t n,
+                         std::vector<uint8_t> &out) {
+  encode_szlzrc_core(src, n, out);
+  uint8_t d = 0;
+  uint32_t ncols = 0, body = 0;
+  if (!detect_columns(src, n, &d, &ncols, &body)) return;
+  const uint32_t tail_len = n - body;
+  std::vector<std::vector<uint8_t>> cols(ncols);
+  {
+    uint32_t j = 0, start = 0;
+    for (uint32_t i = 0; i < body; ++i) {
+      if (src[i] == d) {
+        cols[j].insert(cols[j].end(), src + start, src + i);
+        cols[j].push_back('\n');
+        ++j;
+        start = i + 1;
+      } else if (src[i] == '\n') {
+        cols[j].insert(cols[j].end(), src + start, src + i);
+        cols[j].push_back('\n');
+        ++j;
+        start = i + 1;
+        j = 0;
+      }
+    }
+  }
+  std::vector<std::vector<uint8_t>> pay(ncols);
+  size_t total = 7 + (size_t)ncols * 8 + tail_len;
+  for (uint32_t j = 0; j < ncols; ++j) {
+    encode_szlzrc_core(cols[j].data(), (uint32_t)cols[j].size(), pay[j]);
+    total += pay[j].size();
+  }
+  if (total >= out.size()) return; // keep plain
+  out.clear();
+  out.push_back(0x40u); // column flag (bit 6)
+  out.push_back(d);
+  out.push_back((uint8_t)ncols);
+  out.push_back((uint8_t)tail_len); out.push_back((uint8_t)(tail_len >> 8));
+  out.push_back((uint8_t)(tail_len >> 16)); out.push_back((uint8_t)(tail_len >> 24));
+  for (uint32_t j = 0; j < ncols; ++j) {
+    const uint32_t rl = (uint32_t)cols[j].size(), cl = (uint32_t)pay[j].size();
+    out.push_back((uint8_t)rl); out.push_back((uint8_t)(rl >> 8));
+    out.push_back((uint8_t)(rl >> 16)); out.push_back((uint8_t)(rl >> 24));
+    out.push_back((uint8_t)cl); out.push_back((uint8_t)(cl >> 8));
+    out.push_back((uint8_t)(cl >> 16)); out.push_back((uint8_t)(cl >> 24));
+    out.insert(out.end(), pay[j].begin(), pay[j].end());
+  }
+  out.insert(out.end(), src + body, src + n); // raw tail
+}
+
+int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
+                        uint32_t n);
+
+static int decode_szlzrc_columnar(const uint8_t *src, size_t src_len,
+                                uint8_t *dst, uint32_t n) {
+  if (src_len < 7) return SZIP_ERR_TRUNCATED;
+  const uint8_t d = src[1];
+  const uint32_t ncols = src[2];
+  const uint32_t tail_len = (uint32_t)src[3] | ((uint32_t)src[4] << 8) |
+                            ((uint32_t)src[5] << 16) | ((uint32_t)src[6] << 24);
+  if (ncols < 2 || ncols > 9 || tail_len > n) return SZIP_ERR_CORRUPT;
+  size_t p = 7;
+  std::vector<std::vector<uint8_t>> cols(ncols);
+  for (uint32_t j = 0; j < ncols; ++j) {
+    if (p + 8 > src_len) return SZIP_ERR_TRUNCATED;
+    const uint32_t rl = (uint32_t)src[p] | ((uint32_t)src[p + 1] << 8) |
+                        ((uint32_t)src[p + 2] << 16) | ((uint32_t)src[p + 3] << 24);
+    const uint32_t cl = (uint32_t)src[p + 4] | ((uint32_t)src[p + 5] << 8) |
+                        ((uint32_t)src[p + 6] << 16) | ((uint32_t)src[p + 7] << 24);
+    p += 8;
+    if (rl > n + 16 || cl > src_len || p + cl > src_len) return SZIP_ERR_CORRUPT;
+    cols[j].resize(rl);
+    int e = decode_block_szlzrc(src + p, cl, cols[j].data(), rl);
+    if (e != SZIP_OK) return e;
+    p += cl;
+  }
+  if (p + tail_len != src_len) return SZIP_ERR_CORRUPT;
+  // complete lines = newline count of column 0
+  uint32_t lines = 0;
+  for (uint8_t v : cols[0]) if (v == '\n') ++lines;
+  uint32_t out = 0;
+  std::vector<uint32_t> idx(ncols, 0);
+  for (uint32_t ln = 0; ln < lines; ++ln) {
+    for (uint32_t j = 0; j < ncols; ++j) {
+      const std::vector<uint8_t> &c = cols[j];
+      uint32_t i = idx[j];
+      while (i < c.size() && c[i] != '\n') {
+        if (out >= n) return SZIP_ERR_CORRUPT;
+        dst[out++] = c[i++];
+      }
+      if (i >= c.size()) return SZIP_ERR_CORRUPT;
+      idx[j] = i + 1; // consume '\n'
+      if (j + 1 < ncols) {
+        if (out >= n) return SZIP_ERR_CORRUPT;
+        dst[out++] = d;
+      }
+    }
+    if (out >= n) return SZIP_ERR_CORRUPT;
+    dst[out++] = '\n';
+  }
+  for (uint32_t j = 0; j < ncols; ++j)
+    if (idx[j] != cols[j].size()) return SZIP_ERR_CORRUPT;
+  if (out + tail_len != n) return SZIP_ERR_CORRUPT;
+  if (tail_len) std::memcpy(dst + out, src + p, tail_len);
+  return SZIP_OK;
+}
+
 int decode_block_szlzrc(const uint8_t *src, size_t src_len, uint8_t *dst,
                         uint32_t n) {
   if (src_len < 1) return SZIP_ERR_TRUNCATED;
   const uint32_t mode = src[0];
+  if (mode & 0x40u) return decode_szlzrc_columnar(src, src_len, dst, n);
   const uint32_t delta_id = (mode >> 3) & 7u;
   static const uint32_t kDeltas[5] = {0, 1, 2, 4, 8};
   // delta_id 7 (bit 2 clear) = stored sub-mode: payload is mode byte + raw.
