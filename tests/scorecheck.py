@@ -3,7 +3,7 @@
 
 Encodes every corpus row with the DEFAULT engine and asserts:
   1. every row roundtrips byte-exact,
-  2. every row that won on the v8u scoreboard (14 rows) STILL WINS against
+  2. every row that won on the scoreboard (15 rows incl. dict since v6.1) STILL WINS against
      the frozen best-alternative size (brotli/bzip2/xz from docs/BENCHMARKS.md),
   3. the loss rows stay losses-or-better (no new losses allowed).
 
@@ -14,7 +14,7 @@ import subprocess, sys, os
 
 # (row, path, best-alternative size in bytes) — frozen from docs/BENCHMARKS.md
 ROWS = [("prose","build/corpus20/prose.bin",28427),   # bzip2
-        ("dict","build/corpus20/dict.bin",28837),     # brotli (loss)
+        ("dict","build/corpus20/dict.bin",28837),     # brotli (WIN since v6.1 column transform)
         ("text","build/corpus_text.bin",53954),       # bzip2
         ("code","build/corpus_code.bin",16894),       # brotli (loss)
         ("xml","build/corpus20/xml.bin",13835),       # bzip2 (loss)
@@ -33,8 +33,8 @@ ROWS = [("prose","build/corpus20/prose.bin",28427),   # bzip2
         ("sparse","build/corpus20/sparse.bin",786),   # brotli
         ("mixed","build/corpus20/mixed.bin",53240),   # xz
         ("rand","build/corpus_rand.bin",500005)]      # brotli
-WIN_ROWS = {"prose","text","json","log","html","csv","utf8","b64","hex",
-            "dna","pcm","sparse","mixed","rand"}  # the 14 golden wins
+WIN_ROWS = {"prose","dict","text","json","log","html","csv","utf8","b64","hex",
+            "dna","pcm","sparse","mixed","rand"}  # the 15 golden wins (dict since v6.1)
 
 def main():
     binpath = sys.argv[1] if len(sys.argv) > 1 else "build/g0dszip"
@@ -57,7 +57,7 @@ def main():
         print(f"{name:8} {sz:8,}  vs {alt:8,}  {edge:+6.2f}%  {tag}{bad}", flush=True)
     print(f"\n{wins}W/{losses}L  ({len(WIN_ROWS)} golden wins required)")
     if wins < len(WIN_ROWS):
-        print("FAIL: win count below golden 14W"); fail += 1
+        print("FAIL: win count below golden 15W"); fail += 1
     if fail == 0:
         print("scorecheck PASSED")
     return 1 if fail else 0

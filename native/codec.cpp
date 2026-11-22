@@ -1204,15 +1204,6 @@ static void encode_szlzrc_core(const uint8_t *src, uint32_t n,
   SZ_TOC(tbw, "bwt family (overlapped)");
   // delta stream through the LZ/mixer family too (record data: doubles, ELF
   // words, pcm — aligned deltas are sparse and the phase model codes them).
-  std::vector<uint8_t> cand_delta;
-  if (best_delta) {
-    std::vector<uint8_t> dtmp(n);
-    const uint32_t dlt = (best_delta == 1) ? 1u : (best_delta == 2) ? 2u
-                         : (best_delta == 3) ? 4u : 8u;
-    for (uint32_t i = 0; i < n; ++i)
-      dtmp[i] = (uint8_t)(src[i] - (i >= dlt ? src[i - dlt] : 0));
-    encode_szlzrc_core(dtmp.data(), n, cand_delta);
-  }
   // Phase 2 (deep parse): run the expensive modes only when they could
   // still beat the cheap best (the deep parse historically buys ~0-0.5%).
   // Skip the deep wave when the cheap parse already dominates: BWT does not
@@ -1223,7 +1214,7 @@ static void encode_szlzrc_core(const uint8_t *src, uint32_t n,
   // Deep parse wave: measured to buy <=0.2% over the fast waves on the rows
   // where the LZ side wins, at 50-80% of encode time. Disabled for speed;
   // the fast waves x 4 modes + BWT family are the default.
-  constexpr bool kDeepWave = false;
+  constexpr bool kDeepWave = true;
   if (kDeepWave && !user_fast && (n < 4096 || !bwt_clearly_wins)) {
     std::vector<uint8_t> deep[4];
     {
@@ -1244,19 +1235,9 @@ static void encode_szlzrc_core(const uint8_t *src, uint32_t n,
     for (uint32_t k = 0; k < 4; ++k)
       if ((g_modeset & (1 << k)) && (best == UINT32_MAX || cand[k].size() < cand[best].size())) best = k;
   }
-  const bool dlz_ok = !cand_delta.empty() && cand_delta[0] <= 3;
-  const size_t dlz_size = dlz_ok ? cand_delta.size() - 1 : (size_t)-1;
-  if (best_bwt.size() < cand[best].size() &&
-      best_bwt.size() <= dlz_size + (dlz_ok ? 1u : 0u)) {
+  if (best_bwt.size() < cand[best].size()) {
     out.push_back((uint8_t)((best_delta << 3) | 4u));
     out.insert(out.end(), best_bwt.begin(), best_bwt.end());
-    return;
-  }
-  if (dlz_ok && dlz_size < cand[best].size()) {
-    // cand_delta = [inner mode byte][rANS payload]; the outer byte carries
-    // delta_id + the inner mode so the decoder finds both.
-    out.push_back((uint8_t)((best_delta << 3) | (cand_delta[0] & 7u)));
-    out.insert(out.end(), cand_delta.begin() + 1, cand_delta.end());
     return;
   }
   out.push_back((uint8_t)best); // mode byte: (regime << 1) | mixer
@@ -1275,7 +1256,7 @@ static bool detect_columns(const uint8_t *src, uint32_t n, uint8_t *delim_out,
   uint32_t body = n;
   while (body > 0 && src[body - 1] != '\n') --body;
   if (body < 1024) return false;
-  static const uint8_t kDelims[2] = {'\t', ','};
+  static const uint8_t kDelims[3] = {'\t', ',', '"'};
   for (uint8_t d : kDelims) {
     uint32_t K = 0, lines = 0, cnt = 0;
     bool ok = true;

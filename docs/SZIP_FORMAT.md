@@ -107,7 +107,9 @@ bits 3-5 delta id    (0 = none, 1 = d1, 2 = d2, 3 = d4, 4 = d8; see below)
          incompressible pre-reject; containers with a raw/stored block type
          strip the mode byte and store the raw block instead.  ids 5-6
          are reserved and decoders must reject them.
-bits 6-7 reserved, zero
+bit 6    **column transform flag** (v6.1, see §2.8): the rest of the mode
+         byte is ignored; the payload is a column-stream container
+bit 7    reserved, zero
 ```
 
 LZ path (bit 2 = 0), `mode = (regime << 1) | mixer`:
@@ -135,6 +137,32 @@ last-3 rep offsets) → token stream → adaptive binary range coder (carryless,
 11-bit probabilities). **Literals** are bit-coded through the integer
 context-mixing model of §2.4 ("GOD stage"); token syntax and match/rep coding
 are as in SZLZRC v2.
+
+### 2.8 Column transform (v6.1)
+
+Delimiter-aligned columnar text (every complete line carries exactly K
+delimiter bytes, 1 ≤ K ≤ 8; delimiter is `TAB`, `,` or `"`) is split into
+K+1 per-column streams, each an independent SZLZRC block.  Word columns
+collapse; numeric columns stay near entropy.  The encoder stores the
+columnar form only when it is smaller than the plain form.
+
+Payload after the mode byte:
+
+```
+u8   delimiter byte
+u8   ncols (K+1)
+u32  tail_len   (raw trailing bytes after the last '\n', stored verbatim at the end)
+repeat ncols times:
+    u32 raw_len   (column length, fields joined by '\n')
+    u32 comp_len  (compressed column payload)
+    comp_len bytes: an SZLZRC block payload (its own mode byte)
+tail_len bytes: the raw tail
+```
+
+Decoder: decode each column, split each at `'\n'` into `lines` fields,
+re-interleave `field0 + delim + ... + fieldK + '\n'` per line, then append
+the tail.  `lines` = the newline count of column 0.  Reconstruction must
+consume every column byte and reproduce the block size exactly.
 
 ### 2.1 Range coder
 

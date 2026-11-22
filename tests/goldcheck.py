@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Golden gate for G0D SZIP.
 
-  1. `--max` tier (deep search) must reproduce the frozen v8u golden sizes
+  1. `--max` tier (deep search) must reproduce the frozen v6.1 golden sizes
      byte-count-for-byte-count on every row AND roundtrip exactly — this is
-     the byte-identity guarantee for the 14W/6L scoreboard era.
+     the byte-identity guarantee for the 15W/5L scoreboard era.
   2. the DEFAULT tier must roundtrip every row exactly.
 
 Usage: python3 tests/goldcheck.py [binary]     (default build/g0dszip)
@@ -11,10 +11,10 @@ Exit 0 only if every check passes.
 """
 import subprocess, sys, os
 
-GOLD = {"prose":26408,"dict":34438,"text":53000,"code":17186,"xml":13914,"json":10752,
-        "log":8917,"html":12015,"csv":32601,"utf8":14763,"b64":24407,"hex":34243,
-        "dna":19005,"src":52132,"floats":92795,"pcm":101873,"binary":64266,
-        "sparse":780,"mixed":52067,"rand":500004}
+GOLD = {"prose":26276,"dict":24434,"text":52936,"code":17025,"xml":13942,"json":10708,
+        "log":8621,"html":11942,"csv":29834,"utf8":14795,"b64":24394,"hex":34030,
+        "dna":19011,"src":51606,"floats":87341,"pcm":101968,"binary":63521,
+        "sparse":776,"mixed":51010,"rand":500004}
 ROWS = [("prose","build/corpus20/prose.bin"),("dict","build/corpus20/dict.bin"),
         ("text","build/corpus_text.bin"),("code","build/corpus_code.bin"),
         ("xml","build/corpus20/xml.bin"),("json","build/corpus20/json.bin"),

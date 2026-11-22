@@ -2,287 +2,287 @@ G0D SZIP — universe benchmark  (single-run wall times, indicative)
 compressors found: 10
 
 === code  (70,592 B) ===
-  brotli -q 11 -w 24                  16,894 B   23.93%  c   0.14s  d   0.00s  roundtrip ok
-  g0dszip (best)                      17,355 B   24.58%  c   3.12s  d   0.31s  roundtrip ok <-- G0D
-  xz -9e                              17,640 B   24.99%  c   0.09s  d   0.01s  roundtrip ok
-  zstd -22 (ultra)                    18,012 B   25.52%  c   0.07s  d   0.00s  roundtrip ok
-  g0dszip -f (fast)                   18,127 B   25.68%  c   1.58s  d   0.35s  roundtrip ok <-- G0D
+  brotli -q 11 -w 24                  16,894 B   23.93%  c   0.12s  d   0.00s  roundtrip ok
+  g0dszip (best)                      17,242 B   24.42%  c   4.04s  d   0.25s  roundtrip ok <-- G0D
+  xz -9e                              17,640 B   24.99%  c   0.06s  d   0.01s  roundtrip ok
+  g0dszip -f (fast)                   17,970 B   25.46%  c   1.42s  d   0.25s  roundtrip ok <-- G0D
+  zstd -22 (ultra)                    18,012 B   25.52%  c   0.04s  d   0.00s  roundtrip ok
   bzip2 -9                            18,214 B   25.80%  c   0.02s  d   0.01s  roundtrip ok
-  gzip -9                             19,282 B   27.31%  c   0.07s  d   0.01s  roundtrip ok
+  gzip -9                             19,282 B   27.31%  c   0.01s  d   0.01s  roundtrip ok
   lz4 hc-12                           23,869 B   33.81%  c   0.01s  d   0.00s  roundtrip ok
-  g0dszip --sprint                    26,740 B   37.88%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
-  snappy                              29,674 B   42.04%  c   0.01s  d   0.00s  roundtrip ok
-  -> vs best alternative (brotli -q 11 -w 24 16,894 B): behind by 2.73%
+  g0dszip --sprint                    28,000 B   39.66%  c   0.00s  d   0.00s  roundtrip ok <-- G0D
+  snappy                              29,674 B   42.04%  c   0.00s  d   0.00s  roundtrip ok
+  -> vs best alternative (brotli -q 11 -w 24 16,894 B): behind by 2.06%
 
 === text  (500,003 B) ===
-  g0dszip (best)                      53,000 B   10.60%  c   3.34s  d   0.56s  roundtrip ok <-- G0D
-  g0dszip -f (fast)                   53,000 B   10.60%  c   3.02s  d   0.58s  roundtrip ok <-- G0D
-  bzip2 -9                            53,954 B   10.79%  c   0.06s  d   0.03s  roundtrip ok
-  zstd -22 (ultra)                    76,343 B   15.27%  c   0.24s  d   0.00s  roundtrip ok
-  xz -9e                              76,764 B   15.35%  c   0.27s  d   0.01s  roundtrip ok
-  brotli -q 11 -w 24                  78,420 B   15.68%  c   0.90s  d   0.00s  roundtrip ok
-  gzip -9                             86,539 B   17.31%  c   0.05s  d   0.01s  roundtrip ok
+  g0dszip (best)                      52,936 B   10.59%  c   3.23s  d   0.37s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   52,936 B   10.59%  c   2.87s  d   0.51s  roundtrip ok <-- G0D
+  bzip2 -9                            53,954 B   10.79%  c   0.07s  d   0.03s  roundtrip ok
+  zstd -22 (ultra)                    76,343 B   15.27%  c   0.31s  d   0.00s  roundtrip ok
+  xz -9e                              76,764 B   15.35%  c   0.26s  d   0.01s  roundtrip ok
+  brotli -q 11 -w 24                  78,420 B   15.68%  c   0.99s  d   0.00s  roundtrip ok
+  gzip -9                             86,539 B   17.31%  c   0.06s  d   0.01s  roundtrip ok
   lz4 hc-12                          106,834 B   21.37%  c   0.04s  d   0.00s  roundtrip ok
-  g0dszip --sprint                   144,716 B   28.94%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  g0dszip --sprint                   147,255 B   29.45%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
   snappy                             150,185 B   30.04%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (bzip2 -9 53,954 B): WIN by 1.77%
+  -> vs best alternative (bzip2 -9 53,954 B): WIN by 1.89%
 
 === rand  (500,000 B) ===
   g0dszip (best)                     500,004 B  100.00%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
-  g0dszip -f (fast)                  500,004 B  100.00%  c   0.01s  d   0.02s  roundtrip ok <-- G0D
-  brotli -q 11 -w 24                 500,005 B  100.00%  c   0.28s  d   0.00s  roundtrip ok
-  zstd -22 (ultra)                   500,021 B  100.00%  c   0.11s  d   0.00s  roundtrip ok
-  g0dszip --sprint                   500,022 B  100.00%  c   0.08s  d   0.01s  roundtrip ok <-- G0D
-  lz4 hc-12                          500,051 B  100.01%  c   0.01s  d   0.00s  roundtrip ok
+  g0dszip -f (fast)                  500,004 B  100.00%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  brotli -q 11 -w 24                 500,005 B  100.00%  c   0.26s  d   0.00s  roundtrip ok
+  zstd -22 (ultra)                   500,021 B  100.00%  c   0.12s  d   0.00s  roundtrip ok
+  g0dszip --sprint                   500,022 B  100.00%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  lz4 hc-12                          500,051 B  100.01%  c   0.02s  d   0.00s  roundtrip ok
   snappy                             500,074 B  100.01%  c   0.00s  d   0.00s  roundtrip ok
-  xz -9e                             500,084 B  100.02%  c   0.28s  d   0.01s  roundtrip ok
-  gzip -9                            500,107 B  100.02%  c   0.03s  d   0.01s  roundtrip ok
-  bzip2 -9                           502,702 B  100.54%  c   0.19s  d   0.09s  roundtrip ok
+  xz -9e                             500,084 B  100.02%  c   0.29s  d   0.01s  roundtrip ok
+  gzip -9                            500,107 B  100.02%  c   0.02s  d   0.01s  roundtrip ok
+  bzip2 -9                           502,729 B  100.55%  c   0.11s  d   0.05s  roundtrip ok
   -> vs best alternative (brotli -q 11 -w 24 500,005 B): WIN by 0.00%
 
 === src  (277,530 B) ===
-  brotli -q 11 -w 24                  50,871 B   18.33%  c   0.48s  d   0.00s  roundtrip ok
-  xz -9e                              51,796 B   18.66%  c   0.19s  d   0.01s  roundtrip ok
-  g0dszip (best)                      53,786 B   19.38%  c   3.60s  d   0.63s  roundtrip ok <-- G0D
-  zstd -22 (ultra)                    56,066 B   20.20%  c   0.16s  d   0.00s  roundtrip ok
-  g0dszip -f (fast)                   56,098 B   20.21%  c   3.11s  d   0.61s  roundtrip ok <-- G0D
-  bzip2 -9                            65,288 B   23.52%  c   0.04s  d   0.02s  roundtrip ok
-  gzip -9                             76,747 B   27.65%  c   0.06s  d   0.01s  roundtrip ok
+  brotli -q 11 -w 24                  50,871 B   18.33%  c   0.46s  d   0.00s  roundtrip ok
+  xz -9e                              51,796 B   18.66%  c   0.15s  d   0.02s  roundtrip ok
+  g0dszip (best)                      53,406 B   19.24%  c   6.18s  d   0.44s  roundtrip ok <-- G0D
+  zstd -22 (ultra)                    56,066 B   20.20%  c   0.13s  d   0.00s  roundtrip ok
+  g0dszip -f (fast)                   56,069 B   20.20%  c   2.76s  d   0.44s  roundtrip ok <-- G0D
+  bzip2 -9                            65,288 B   23.52%  c   0.03s  d   0.02s  roundtrip ok
+  gzip -9                             76,747 B   27.65%  c   0.04s  d   0.01s  roundtrip ok
   lz4 hc-12                           98,238 B   35.40%  c   0.02s  d   0.00s  roundtrip ok
-  g0dszip --sprint                   111,967 B   40.34%  c   0.02s  d   0.01s  roundtrip ok <-- G0D
+  g0dszip --sprint                   115,382 B   41.57%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
   snappy                             119,236 B   42.96%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (brotli -q 11 -w 24 50,871 B): behind by 5.73%
+  -> vs best alternative (brotli -q 11 -w 24 50,871 B): behind by 4.98%
 
 === b64  (131,072 B) ===
-  g0dszip (best)                      24,407 B   18.62%  c   2.83s  d   0.62s  roundtrip ok <-- G0D
-  g0dszip -f (fast)                   24,407 B   18.62%  c   2.76s  d   0.43s  roundtrip ok <-- G0D
-  bzip2 -9                            25,452 B   19.42%  c   0.03s  d   0.02s  roundtrip ok
-  xz -9e                              32,988 B   25.17%  c   0.10s  d   0.01s  roundtrip ok
-  brotli -q 11 -w 24                  33,007 B   25.18%  c   0.35s  d   0.00s  roundtrip ok
-  zstd -22 (ultra)                    33,120 B   25.27%  c   0.15s  d   0.00s  roundtrip ok
-  gzip -9                             36,886 B   28.14%  c   0.04s  d   0.01s  roundtrip ok
-  lz4 hc-12                           41,663 B   31.79%  c   0.04s  d   0.00s  roundtrip ok
-  g0dszip --sprint                    54,183 B   41.34%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  g0dszip (best)                      24,394 B   18.61%  c   1.96s  d   0.32s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   24,394 B   18.61%  c   1.99s  d   0.31s  roundtrip ok <-- G0D
+  bzip2 -9                            25,452 B   19.42%  c   0.02s  d   0.01s  roundtrip ok
+  xz -9e                              32,988 B   25.17%  c   0.07s  d   0.01s  roundtrip ok
+  brotli -q 11 -w 24                  33,007 B   25.18%  c   0.23s  d   0.00s  roundtrip ok
+  zstd -22 (ultra)                    33,120 B   25.27%  c   0.10s  d   0.00s  roundtrip ok
+  gzip -9                             36,886 B   28.14%  c   0.03s  d   0.01s  roundtrip ok
+  lz4 hc-12                           41,663 B   31.79%  c   0.02s  d   0.00s  roundtrip ok
+  g0dszip --sprint                    58,691 B   44.78%  c   0.01s  d   0.00s  roundtrip ok <-- G0D
   snappy                              62,974 B   48.05%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (bzip2 -9 25,452 B): WIN by 4.11%
+  -> vs best alternative (bzip2 -9 25,452 B): WIN by 4.16%
 
 === binary  (131,072 B) ===
-  brotli -q 11 -w 24                  63,470 B   48.42%  c   0.54s  d   0.00s  roundtrip ok
-  g0dszip (best)                      64,266 B   49.03%  c   3.52s  d   0.72s  roundtrip ok <-- G0D
-  g0dszip -f (fast)                   64,266 B   49.03%  c   2.95s  d   0.54s  roundtrip ok <-- G0D
-  xz -9e                              65,172 B   49.72%  c   0.15s  d   0.01s  roundtrip ok
+  brotli -q 11 -w 24                  63,470 B   48.42%  c   0.45s  d   0.00s  roundtrip ok
+  g0dszip (best)                      63,755 B   48.64%  c   5.97s  d   0.41s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   63,869 B   48.73%  c   2.22s  d   0.37s  roundtrip ok <-- G0D
+  xz -9e                              65,172 B   49.72%  c   0.13s  d   0.01s  roundtrip ok
   zstd -22 (ultra)                    67,291 B   51.34%  c   0.05s  d   0.00s  roundtrip ok
-  bzip2 -9                            67,809 B   51.73%  c   0.02s  d   0.02s  roundtrip ok
-  gzip -9                             69,440 B   52.98%  c   0.07s  d   0.01s  roundtrip ok
+  bzip2 -9                            67,809 B   51.73%  c   0.02s  d   0.01s  roundtrip ok
+  gzip -9                             69,440 B   52.98%  c   0.06s  d   0.01s  roundtrip ok
   lz4 hc-12                           79,812 B   60.89%  c   0.03s  d   0.00s  roundtrip ok
-  g0dszip --sprint                    86,327 B   65.86%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  g0dszip --sprint                    86,928 B   66.32%  c   0.01s  d   0.00s  roundtrip ok <-- G0D
   snappy                              93,102 B   71.03%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (brotli -q 11 -w 24 63,470 B): behind by 1.25%
+  -> vs best alternative (brotli -q 11 -w 24 63,470 B): behind by 0.45%
 
 === csv  (131,072 B) ===
-  g0dszip (best)                      32,601 B   24.87%  c   2.95s  d   0.43s  roundtrip ok <-- G0D
-  g0dszip -f (fast)                   32,601 B   24.87%  c   2.66s  d   0.48s  roundtrip ok <-- G0D
+  g0dszip (best)                      30,299 B   23.12%  c  14.12s  d   1.59s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   30,317 B   23.13%  c  10.79s  d   1.50s  roundtrip ok <-- G0D
   bzip2 -9                            34,309 B   26.18%  c   0.02s  d   0.01s  roundtrip ok
-  brotli -q 11 -w 24                  41,001 B   31.28%  c   0.26s  d   0.00s  roundtrip ok
-  xz -9e                              41,676 B   31.80%  c   0.10s  d   0.01s  roundtrip ok
-  zstd -22 (ultra)                    45,164 B   34.46%  c   0.07s  d   0.00s  roundtrip ok
-  gzip -9                             47,704 B   36.40%  c   0.04s  d   0.01s  roundtrip ok
-  lz4 hc-12                           58,390 B   44.55%  c   0.02s  d   0.00s  roundtrip ok
-  g0dszip --sprint                    71,518 B   54.56%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  brotli -q 11 -w 24                  41,001 B   31.28%  c   0.23s  d   0.00s  roundtrip ok
+  xz -9e                              41,676 B   31.80%  c   0.06s  d   0.01s  roundtrip ok
+  zstd -22 (ultra)                    45,164 B   34.46%  c   0.08s  d   0.00s  roundtrip ok
+  gzip -9                             47,704 B   36.40%  c   0.06s  d   0.01s  roundtrip ok
+  lz4 hc-12                           58,390 B   44.55%  c   0.01s  d   0.00s  roundtrip ok
+  g0dszip --sprint                    74,510 B   56.85%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
   snappy                              79,770 B   60.86%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (bzip2 -9 34,309 B): WIN by 4.98%
+  -> vs best alternative (bzip2 -9 34,309 B): WIN by 11.69%
 
 === dict  (131,072 B) ===
-  brotli -q 11 -w 24                  28,837 B   22.00%  c   0.20s  d   0.00s  roundtrip ok
-  zstd -22 (ultra)                    33,750 B   25.75%  c   0.07s  d   0.00s  roundtrip ok
-  g0dszip -f (fast)                   35,248 B   26.89%  c   2.25s  d   0.40s  roundtrip ok <-- G0D
-  g0dszip (best)                      35,403 B   27.01%  c   2.77s  d   0.56s  roundtrip ok <-- G0D
+  g0dszip (best)                      24,893 B   18.99%  c  11.53s  d   0.77s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   25,325 B   19.32%  c   6.02s  d   0.64s  roundtrip ok <-- G0D
+  brotli -q 11 -w 24                  28,837 B   22.00%  c   0.29s  d   0.00s  roundtrip ok
+  zstd -22 (ultra)                    33,750 B   25.75%  c   0.08s  d   0.00s  roundtrip ok
   xz -9e                              36,660 B   27.97%  c   0.07s  d   0.01s  roundtrip ok
-  bzip2 -9                            41,951 B   32.01%  c   0.02s  d   0.02s  roundtrip ok
+  bzip2 -9                            41,951 B   32.01%  c   0.02s  d   0.01s  roundtrip ok
   gzip -9                             53,651 B   40.93%  c   0.02s  d   0.01s  roundtrip ok
   lz4 hc-12                           67,227 B   51.29%  c   0.01s  d   0.00s  roundtrip ok
-  g0dszip --sprint                    82,837 B   63.20%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  g0dszip --sprint                    85,174 B   64.98%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
   snappy                              90,899 B   69.35%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (brotli -q 11 -w 24 28,837 B): behind by 22.77%
+  -> vs best alternative (brotli -q 11 -w 24 28,837 B): WIN by 13.68%
 
 === dna  (131,072 B) ===
-  g0dszip (best)                      19,005 B   14.50%  c   2.05s  d   0.33s  roundtrip ok <-- G0D
-  g0dszip -f (fast)                   19,005 B   14.50%  c   2.21s  d   0.43s  roundtrip ok <-- G0D
+  g0dszip (best)                      19,011 B   14.50%  c   2.27s  d   0.31s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   19,011 B   14.50%  c   2.04s  d   0.39s  roundtrip ok <-- G0D
   bzip2 -9                            20,218 B   15.43%  c   0.02s  d   0.01s  roundtrip ok
-  brotli -q 11 -w 24                  21,048 B   16.06%  c   0.36s  d   0.00s  roundtrip ok
-  zstd -22 (ultra)                    21,436 B   16.35%  c   0.13s  d   0.00s  roundtrip ok
-  xz -9e                              21,732 B   16.58%  c   0.08s  d   0.01s  roundtrip ok
-  gzip -9                             23,602 B   18.01%  c   0.08s  d   0.01s  roundtrip ok
+  brotli -q 11 -w 24                  21,048 B   16.06%  c   0.29s  d   0.00s  roundtrip ok
+  zstd -22 (ultra)                    21,436 B   16.35%  c   0.09s  d   0.00s  roundtrip ok
+  xz -9e                              21,732 B   16.58%  c   0.07s  d   0.01s  roundtrip ok
+  gzip -9                             23,602 B   18.01%  c   0.14s  d   0.01s  roundtrip ok
   lz4 hc-12                           29,620 B   22.60%  c   0.03s  d   0.00s  roundtrip ok
-  g0dszip --sprint                    44,915 B   34.27%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  g0dszip --sprint                    51,061 B   38.96%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
   snappy                              51,276 B   39.12%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (bzip2 -9 20,218 B): WIN by 6.00%
+  -> vs best alternative (bzip2 -9 20,218 B): WIN by 5.97%
 
 === floats  (131,072 B) ===
-  xz -9e                              84,992 B   64.84%  c   0.14s  d   0.01s  roundtrip ok
-  brotli -q 11 -w 24                  92,123 B   70.28%  c   0.66s  d   0.00s  roundtrip ok
-  g0dszip (best)                      93,567 B   71.39%  c   2.82s  d   0.67s  roundtrip ok <-- G0D
-  g0dszip -f (fast)                   93,905 B   71.64%  c   2.57s  d   0.57s  roundtrip ok <-- G0D
-  zstd -22 (ultra)                    97,335 B   74.26%  c   0.06s  d   0.00s  roundtrip ok
+  xz -9e                              84,992 B   64.84%  c   0.11s  d   0.01s  roundtrip ok
+  g0dszip (best)                      87,450 B   66.72%  c   5.70s  d   0.38s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   87,963 B   67.11%  c   1.93s  d   0.39s  roundtrip ok <-- G0D
+  brotli -q 11 -w 24                  92,123 B   70.28%  c   0.55s  d   0.00s  roundtrip ok
+  zstd -22 (ultra)                    97,335 B   74.26%  c   0.03s  d   0.00s  roundtrip ok
   gzip -9                             99,781 B   76.13%  c   0.02s  d   0.01s  roundtrip ok
-  bzip2 -9                           100,734 B   76.85%  c   0.03s  d   0.02s  roundtrip ok
-  lz4 hc-12                          107,673 B   82.15%  c   0.01s  d   0.00s  roundtrip ok
-  g0dszip --sprint                   109,912 B   83.86%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  bzip2 -9                           100,734 B   76.85%  c   0.02s  d   0.01s  roundtrip ok
+  lz4 hc-12                          107,673 B   82.15%  c   0.00s  d   0.00s  roundtrip ok
+  g0dszip --sprint                   110,290 B   84.14%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
   snappy                             131,098 B  100.02%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (xz -9e 84,992 B): behind by 10.09%
+  -> vs best alternative (xz -9e 84,992 B): behind by 2.89%
 
 === hex  (131,072 B) ===
-  g0dszip (best)                      34,243 B   26.13%  c   2.68s  d   0.42s  roundtrip ok <-- G0D
-  g0dszip -f (fast)                   34,243 B   26.13%  c   2.32s  d   0.54s  roundtrip ok <-- G0D
-  bzip2 -9                            37,114 B   28.32%  c   0.02s  d   0.01s  roundtrip ok
-  brotli -q 11 -w 24                  41,051 B   31.32%  c   0.38s  d   0.00s  roundtrip ok
-  xz -9e                              41,564 B   31.71%  c   0.10s  d   0.01s  roundtrip ok
-  zstd -22 (ultra)                    44,763 B   34.15%  c   0.08s  d   0.00s  roundtrip ok
+  g0dszip (best)                      34,030 B   25.96%  c   2.03s  d   0.29s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   34,030 B   25.96%  c   1.64s  d   0.27s  roundtrip ok <-- G0D
+  bzip2 -9                            37,114 B   28.32%  c   0.01s  d   0.01s  roundtrip ok
+  brotli -q 11 -w 24                  41,051 B   31.32%  c   0.29s  d   0.00s  roundtrip ok
+  xz -9e                              41,564 B   31.71%  c   0.07s  d   0.01s  roundtrip ok
+  zstd -22 (ultra)                    44,763 B   34.15%  c   0.06s  d   0.00s  roundtrip ok
   gzip -9                             47,547 B   36.28%  c   0.05s  d   0.01s  roundtrip ok
-  lz4 hc-12                           56,535 B   43.13%  c   0.04s  d   0.00s  roundtrip ok
-  g0dszip --sprint                    68,463 B   52.23%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  lz4 hc-12                           56,535 B   43.13%  c   0.03s  d   0.00s  roundtrip ok
+  g0dszip --sprint                    71,180 B   54.31%  c   0.01s  d   0.00s  roundtrip ok <-- G0D
   snappy                              74,350 B   56.72%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (bzip2 -9 37,114 B): WIN by 7.74%
+  -> vs best alternative (bzip2 -9 37,114 B): WIN by 8.31%
 
 === html  (131,072 B) ===
-  g0dszip (best)                      12,015 B    9.17%  c   2.62s  d   0.45s  roundtrip ok <-- G0D
-  g0dszip -f (fast)                   12,015 B    9.17%  c   2.79s  d   0.48s  roundtrip ok <-- G0D
+  g0dszip (best)                      11,942 B    9.11%  c   1.90s  d   0.29s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   11,942 B    9.11%  c   1.63s  d   0.27s  roundtrip ok <-- G0D
   bzip2 -9                            12,036 B    9.18%  c   0.02s  d   0.01s  roundtrip ok
-  brotli -q 11 -w 24                  14,857 B   11.33%  c   0.32s  d   0.00s  roundtrip ok
-  xz -9e                              15,252 B   11.64%  c   0.07s  d   0.01s  roundtrip ok
+  brotli -q 11 -w 24                  14,857 B   11.33%  c   0.31s  d   0.00s  roundtrip ok
+  xz -9e                              15,252 B   11.64%  c   0.06s  d   0.01s  roundtrip ok
   zstd -22 (ultra)                    15,680 B   11.96%  c   0.14s  d   0.00s  roundtrip ok
-  gzip -9                             16,919 B   12.91%  c   0.02s  d   0.01s  roundtrip ok
+  gzip -9                             16,919 B   12.91%  c   0.01s  d   0.01s  roundtrip ok
   lz4 hc-12                           19,534 B   14.90%  c   0.01s  d   0.00s  roundtrip ok
-  g0dszip --sprint                    24,951 B   19.04%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  g0dszip --sprint                    26,992 B   20.59%  c   0.00s  d   0.00s  roundtrip ok <-- G0D
   snappy                              30,747 B   23.46%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (bzip2 -9 12,036 B): WIN by 0.17%
+  -> vs best alternative (bzip2 -9 12,036 B): WIN by 0.78%
 
 === json  (131,072 B) ===
-  g0dszip (best)                      10,752 B    8.20%  c   2.01s  d   0.35s  roundtrip ok <-- G0D
-  g0dszip -f (fast)                   10,752 B    8.20%  c   1.66s  d   0.32s  roundtrip ok <-- G0D
-  bzip2 -9                            11,133 B    8.49%  c   0.03s  d   0.01s  roundtrip ok
-  brotli -q 11 -w 24                  12,867 B    9.82%  c   0.23s  d   0.00s  roundtrip ok
+  g0dszip (best)                      10,708 B    8.17%  c   1.72s  d   0.27s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   10,708 B    8.17%  c   1.55s  d   0.32s  roundtrip ok <-- G0D
+  bzip2 -9                            11,133 B    8.49%  c   0.02s  d   0.01s  roundtrip ok
+  brotli -q 11 -w 24                  12,867 B    9.82%  c   0.21s  d   0.00s  roundtrip ok
   xz -9e                              13,156 B   10.04%  c   0.06s  d   0.01s  roundtrip ok
-  zstd -22 (ultra)                    13,614 B   10.39%  c   0.10s  d   0.00s  roundtrip ok
-  gzip -9                             16,313 B   12.45%  c   0.02s  d   0.01s  roundtrip ok
+  zstd -22 (ultra)                    13,614 B   10.39%  c   0.11s  d   0.00s  roundtrip ok
+  gzip -9                             16,313 B   12.45%  c   0.02s  d   0.00s  roundtrip ok
   lz4 hc-12                           22,017 B   16.80%  c   0.01s  d   0.00s  roundtrip ok
-  g0dszip --sprint                    29,052 B   22.16%  c   0.01s  d   0.00s  roundtrip ok <-- G0D
+  g0dszip --sprint                    31,567 B   24.08%  c   0.00s  d   0.00s  roundtrip ok <-- G0D
   snappy                              32,431 B   24.74%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (bzip2 -9 11,133 B): WIN by 3.42%
+  -> vs best alternative (bzip2 -9 11,133 B): WIN by 3.82%
 
 === log  (131,072 B) ===
-  g0dszip (best)                       8,917 B    6.80%  c   2.77s  d   0.35s  roundtrip ok <-- G0D
-  g0dszip -f (fast)                    8,917 B    6.80%  c   2.30s  d   0.41s  roundtrip ok <-- G0D
+  g0dszip (best)                       8,621 B    6.58%  c  18.79s  d   2.25s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                    8,625 B    6.58%  c  11.36s  d   1.43s  roundtrip ok <-- G0D
   bzip2 -9                             8,948 B    6.83%  c   0.02s  d   0.01s  roundtrip ok
-  brotli -q 11 -w 24                  11,166 B    8.52%  c   0.22s  d   0.00s  roundtrip ok
-  xz -9e                              11,172 B    8.52%  c   0.07s  d   0.01s  roundtrip ok
+  brotli -q 11 -w 24                  11,166 B    8.52%  c   0.23s  d   0.00s  roundtrip ok
+  xz -9e                              11,172 B    8.52%  c   0.05s  d   0.01s  roundtrip ok
   zstd -22 (ultra)                    11,589 B    8.84%  c   0.13s  d   0.00s  roundtrip ok
   gzip -9                             13,495 B   10.30%  c   0.01s  d   0.01s  roundtrip ok
   lz4 hc-12                           17,404 B   13.28%  c   0.01s  d   0.00s  roundtrip ok
-  g0dszip --sprint                    22,888 B   17.46%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  g0dszip --sprint                    25,083 B   19.14%  c   0.01s  d   0.00s  roundtrip ok <-- G0D
   snappy                              26,010 B   19.84%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (bzip2 -9 8,948 B): WIN by 0.35%
+  -> vs best alternative (bzip2 -9 8,948 B): WIN by 3.65%
 
 === mixed  (131,072 B) ===
-  g0dszip (best)                      52,307 B   39.91%  c   2.89s  d   0.37s  roundtrip ok <-- G0D
-  xz -9e                              53,240 B   40.62%  c   0.11s  d   0.01s  roundtrip ok
-  brotli -q 11 -w 24                  53,451 B   40.78%  c   0.31s  d   0.00s  roundtrip ok
-  g0dszip -f (fast)                   54,457 B   41.55%  c   2.24s  d   0.35s  roundtrip ok <-- G0D
-  bzip2 -9                            56,973 B   43.47%  c   0.03s  d   0.02s  roundtrip ok
-  zstd -22 (ultra)                    56,979 B   43.47%  c   0.07s  d   0.00s  roundtrip ok
-  gzip -9                             61,722 B   47.09%  c   0.03s  d   0.01s  roundtrip ok
+  g0dszip (best)                      51,501 B   39.29%  c   4.40s  d   0.31s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   53,049 B   40.47%  c   1.80s  d   0.26s  roundtrip ok <-- G0D
+  xz -9e                              53,240 B   40.62%  c   0.09s  d   0.01s  roundtrip ok
+  brotli -q 11 -w 24                  53,451 B   40.78%  c   0.27s  d   0.00s  roundtrip ok
+  bzip2 -9                            56,973 B   43.47%  c   0.02s  d   0.01s  roundtrip ok
+  zstd -22 (ultra)                    56,979 B   43.47%  c   0.05s  d   0.00s  roundtrip ok
+  gzip -9                             61,722 B   47.09%  c   0.01s  d   0.01s  roundtrip ok
   lz4 hc-12                           72,357 B   55.20%  c   0.01s  d   0.00s  roundtrip ok
-  g0dszip --sprint                    78,184 B   59.65%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  g0dszip --sprint                    80,155 B   61.15%  c   0.01s  d   0.00s  roundtrip ok <-- G0D
   snappy                              85,583 B   65.29%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (xz -9e 53,240 B): WIN by 1.75%
+  -> vs best alternative (xz -9e 53,240 B): WIN by 3.27%
 
 === pcm  (131,072 B) ===
-  g0dszip (best)                     101,873 B   77.72%  c   2.55s  d   0.46s  roundtrip ok <-- G0D
-  g0dszip -f (fast)                  101,873 B   77.72%  c   2.75s  d   0.59s  roundtrip ok <-- G0D
-  brotli -q 11 -w 24                 114,926 B   87.68%  c   0.50s  d   0.00s  roundtrip ok
-  bzip2 -9                           122,971 B   93.82%  c   0.03s  d   0.02s  roundtrip ok
-  xz -9e                             124,512 B   95.00%  c   0.16s  d   0.02s  roundtrip ok
-  gzip -9                            127,322 B   97.14%  c   0.02s  d   0.02s  roundtrip ok
-  zstd -22 (ultra)                   127,575 B   97.33%  c   0.07s  d   0.00s  roundtrip ok
-  g0dszip --sprint                   131,076 B  100.00%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  g0dszip (best)                     101,968 B   77.80%  c   2.03s  d   0.33s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                  101,968 B   77.80%  c   1.78s  d   0.36s  roundtrip ok <-- G0D
+  brotli -q 11 -w 24                 114,926 B   87.68%  c   0.44s  d   0.00s  roundtrip ok
+  bzip2 -9                           122,971 B   93.82%  c   0.03s  d   0.01s  roundtrip ok
+  xz -9e                             124,512 B   95.00%  c   0.11s  d   0.01s  roundtrip ok
+  gzip -9                            127,322 B   97.14%  c   0.01s  d   0.01s  roundtrip ok
+  zstd -22 (ultra)                   127,575 B   97.33%  c   0.03s  d   0.00s  roundtrip ok
+  g0dszip --sprint                   131,076 B  100.00%  c   0.01s  d   0.00s  roundtrip ok <-- G0D
   snappy                             131,098 B  100.02%  c   0.00s  d   0.00s  roundtrip ok
   lz4 hc-12                          131,099 B  100.02%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (brotli -q 11 -w 24 114,926 B): WIN by 11.36%
+  -> vs best alternative (brotli -q 11 -w 24 114,926 B): WIN by 11.28%
 
 === prose  (131,072 B) ===
-  g0dszip (best)                      26,408 B   20.15%  c   2.46s  d   0.41s  roundtrip ok <-- G0D
-  g0dszip -f (fast)                   26,408 B   20.15%  c   2.20s  d   0.37s  roundtrip ok <-- G0D
-  bzip2 -9                            28,427 B   21.69%  c   0.02s  d   0.01s  roundtrip ok
+  g0dszip (best)                      26,276 B   20.05%  c   1.76s  d   0.26s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   26,276 B   20.05%  c   1.50s  d   0.27s  roundtrip ok <-- G0D
+  bzip2 -9                            28,427 B   21.69%  c   0.03s  d   0.01s  roundtrip ok
   brotli -q 11 -w 24                  32,793 B   25.02%  c   0.27s  d   0.00s  roundtrip ok
   zstd -22 (ultra)                    33,285 B   25.39%  c   0.07s  d   0.00s  roundtrip ok
-  xz -9e                              33,292 B   25.40%  c   0.07s  d   0.01s  roundtrip ok
-  gzip -9                             36,679 B   27.98%  c   0.06s  d   0.01s  roundtrip ok
+  xz -9e                              33,292 B   25.40%  c   0.06s  d   0.01s  roundtrip ok
+  gzip -9                             36,679 B   27.98%  c   0.07s  d   0.02s  roundtrip ok
   lz4 hc-12                           42,781 B   32.64%  c   0.03s  d   0.00s  roundtrip ok
-  g0dszip --sprint                    54,608 B   41.66%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  g0dszip --sprint                    58,608 B   44.71%  c   0.00s  d   0.00s  roundtrip ok <-- G0D
   snappy                              61,607 B   47.00%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (bzip2 -9 28,427 B): WIN by 7.10%
+  -> vs best alternative (bzip2 -9 28,427 B): WIN by 7.57%
 
 === sparse  (131,072 B) ===
-  g0dszip (best)                         780 B    0.60%  c   2.03s  d   0.31s  roundtrip ok <-- G0D
+  g0dszip (best)                         776 B    0.59%  c   3.86s  d   0.26s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                      784 B    0.60%  c   1.54s  d   0.24s  roundtrip ok <-- G0D
   brotli -q 11 -w 24                     786 B    0.60%  c   0.02s  d   0.00s  roundtrip ok
-  g0dszip -f (fast)                      787 B    0.60%  c   1.72s  d   0.32s  roundtrip ok <-- G0D
   zstd -22 (ultra)                       820 B    0.63%  c   0.00s  d   0.00s  roundtrip ok
-  g0dszip --sprint                       865 B    0.66%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  g0dszip --sprint                       865 B    0.66%  c   0.00s  d   0.00s  roundtrip ok <-- G0D
   xz -9e                                 912 B    0.70%  c   0.02s  d   0.01s  roundtrip ok
-  bzip2 -9                             1,020 B    0.78%  c   0.01s  d   0.01s  roundtrip ok
-  gzip -9                              1,034 B    0.79%  c   0.01s  d   0.01s  roundtrip ok
+  bzip2 -9                             1,020 B    0.78%  c   0.01s  d   0.00s  roundtrip ok
+  gzip -9                              1,034 B    0.79%  c   0.01s  d   0.00s  roundtrip ok
   lz4 hc-12                            1,331 B    1.02%  c   0.00s  d   0.00s  roundtrip ok
   snappy                               6,921 B    5.28%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (brotli -q 11 -w 24 786 B): WIN by 0.76%
+  -> vs best alternative (brotli -q 11 -w 24 786 B): WIN by 1.27%
 
 === utf8  (131,072 B) ===
-  g0dszip (best)                      14,763 B   11.26%  c   1.92s  d   0.39s  roundtrip ok <-- G0D
-  g0dszip -f (fast)                   14,763 B   11.26%  c   1.88s  d   0.36s  roundtrip ok <-- G0D
-  bzip2 -9                            14,981 B   11.43%  c   0.03s  d   0.02s  roundtrip ok
-  brotli -q 11 -w 24                  20,973 B   16.00%  c   0.24s  d   0.00s  roundtrip ok
-  zstd -22 (ultra)                    20,989 B   16.01%  c   0.10s  d   0.00s  roundtrip ok
-  xz -9e                              21,212 B   16.18%  c   0.08s  d   0.01s  roundtrip ok
-  gzip -9                             23,091 B   17.62%  c   0.04s  d   0.01s  roundtrip ok
+  g0dszip (best)                      14,795 B   11.29%  c   1.63s  d   0.26s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   14,795 B   11.29%  c   1.54s  d   0.33s  roundtrip ok <-- G0D
+  bzip2 -9                            14,981 B   11.43%  c   0.02s  d   0.01s  roundtrip ok
+  brotli -q 11 -w 24                  20,973 B   16.00%  c   0.19s  d   0.00s  roundtrip ok
+  zstd -22 (ultra)                    20,989 B   16.01%  c   0.07s  d   0.00s  roundtrip ok
+  xz -9e                              21,212 B   16.18%  c   0.06s  d   0.01s  roundtrip ok
+  gzip -9                             23,091 B   17.62%  c   0.02s  d   0.01s  roundtrip ok
   lz4 hc-12                           28,341 B   21.62%  c   0.01s  d   0.00s  roundtrip ok
-  g0dszip --sprint                    38,988 B   29.75%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  g0dszip --sprint                    41,246 B   31.47%  c   0.01s  d   0.00s  roundtrip ok <-- G0D
   snappy                              41,912 B   31.98%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (bzip2 -9 14,981 B): WIN by 1.46%
+  -> vs best alternative (bzip2 -9 14,981 B): WIN by 1.24%
 
 === xml  (131,072 B) ===
   bzip2 -9                            13,835 B   10.56%  c   0.02s  d   0.01s  roundtrip ok
-  g0dszip (best)                      13,914 B   10.62%  c   2.13s  d   0.31s  roundtrip ok <-- G0D
-  g0dszip -f (fast)                   13,914 B   10.62%  c   1.90s  d   0.44s  roundtrip ok <-- G0D
-  brotli -q 11 -w 24                  17,142 B   13.08%  c   0.22s  d   0.00s  roundtrip ok
-  xz -9e                              17,768 B   13.56%  c   0.07s  d   0.01s  roundtrip ok
-  zstd -22 (ultra)                    18,924 B   14.44%  c   0.07s  d   0.00s  roundtrip ok
-  gzip -9                             20,903 B   15.95%  c   0.02s  d   0.01s  roundtrip ok
+  g0dszip (best)                      13,942 B   10.64%  c   1.86s  d   0.27s  roundtrip ok <-- G0D
+  g0dszip -f (fast)                   13,942 B   10.64%  c   1.64s  d   0.30s  roundtrip ok <-- G0D
+  brotli -q 11 -w 24                  17,142 B   13.08%  c   0.21s  d   0.00s  roundtrip ok
+  xz -9e                              17,768 B   13.56%  c   0.06s  d   0.01s  roundtrip ok
+  zstd -22 (ultra)                    18,924 B   14.44%  c   0.08s  d   0.00s  roundtrip ok
+  gzip -9                             20,903 B   15.95%  c   0.01s  d   0.01s  roundtrip ok
   lz4 hc-12                           25,667 B   19.58%  c   0.01s  d   0.00s  roundtrip ok
-  g0dszip --sprint                    31,282 B   23.87%  c   0.01s  d   0.01s  roundtrip ok <-- G0D
+  g0dszip --sprint                    34,119 B   26.03%  c   0.00s  d   0.00s  roundtrip ok <-- G0D
   snappy                              34,636 B   26.43%  c   0.00s  d   0.00s  roundtrip ok
-  -> vs best alternative (bzip2 -9 13,835 B): behind by 0.57%
+  -> vs best alternative (bzip2 -9 13,835 B): behind by 0.77%
 
 === universe verdict ===
-  code  LOSS  vs brotli -q 11 -w 24  (-2.73%)
-  text  WIN  vs bzip2 -9  (+1.77%)
+  code  LOSS  vs brotli -q 11 -w 24  (-2.06%)
+  text  WIN  vs bzip2 -9  (+1.89%)
   rand  WIN  vs brotli -q 11 -w 24  (+0.00%)
-  src   LOSS  vs brotli -q 11 -w 24  (-5.73%)
-  b64   WIN  vs bzip2 -9  (+4.11%)
-  binary LOSS  vs brotli -q 11 -w 24  (-1.25%)
-  csv   WIN  vs bzip2 -9  (+4.98%)
-  dict  LOSS  vs brotli -q 11 -w 24  (-22.77%)
-  dna   WIN  vs bzip2 -9  (+6.00%)
-  floats LOSS  vs xz -9e  (-10.09%)
-  hex   WIN  vs bzip2 -9  (+7.74%)
-  html  WIN  vs bzip2 -9  (+0.17%)
-  json  WIN  vs bzip2 -9  (+3.42%)
-  log   WIN  vs bzip2 -9  (+0.35%)
-  mixed WIN  vs xz -9e  (+1.75%)
-  pcm   WIN  vs brotli -q 11 -w 24  (+11.36%)
-  prose WIN  vs bzip2 -9  (+7.10%)
-  sparse WIN  vs brotli -q 11 -w 24  (+0.76%)
-  utf8  WIN  vs bzip2 -9  (+1.46%)
-  xml   LOSS  vs bzip2 -9  (-0.57%)
+  src   LOSS  vs brotli -q 11 -w 24  (-4.98%)
+  b64   WIN  vs bzip2 -9  (+4.16%)
+  binary LOSS  vs brotli -q 11 -w 24  (-0.45%)
+  csv   WIN  vs bzip2 -9  (+11.69%)
+  dict  WIN  vs brotli -q 11 -w 24  (+13.68%)
+  dna   WIN  vs bzip2 -9  (+5.97%)
+  floats LOSS  vs xz -9e  (-2.89%)
+  hex   WIN  vs bzip2 -9  (+8.31%)
+  html  WIN  vs bzip2 -9  (+0.78%)
+  json  WIN  vs bzip2 -9  (+3.82%)
+  log   WIN  vs bzip2 -9  (+3.65%)
+  mixed WIN  vs xz -9e  (+3.27%)
+  pcm   WIN  vs brotli -q 11 -w 24  (+11.28%)
+  prose WIN  vs bzip2 -9  (+7.57%)
+  sparse WIN  vs brotli -q 11 -w 24  (+1.27%)
+  utf8  WIN  vs bzip2 -9  (+1.24%)
+  xml   LOSS  vs bzip2 -9  (-0.77%)
 
-  14/20 first places
+  15/20 first places
   note: zstd/brotli/lz4/snappy need build/venv (sh tests/benchall.sh);
         extensible codec IDs in .szip v5 leave room for more models.
