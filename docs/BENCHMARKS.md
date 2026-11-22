@@ -141,12 +141,21 @@ Encode wall (single-run CLI, 20 rows): G0D-sprint **0.14 s** vs lz4 hc-12
 0.38 s, bzip2 0.36 s, gzip 0.50 s, zstd-22 1.46 s, xz 1.73 s, brotli 6.12 s —
 sprint is faster than every compressor except snappy (~0.01 s in-process,
 which produces 6.5% more bytes on every row — the classic speed/ratio trade).
-Codec-only wall (`tests/sprintbench`, in-process, 2 threads): encode 31 ms,
-decode 17 ms for the whole corpus.  Roundtrips: 200/200 in `tests/benchall.sh`.
+Codec-only wall (median-of-9, in-process, 2 threads, same VM): sprint encode
+**33.7 ms** / decode **16.4 ms** for the whole corpus; snappy (cramjam, 1
+thread, same run) 7.08 / 4.30 ms.  Snappy wins raw wall — its skip-scan hashes
+half the bytes — but produces 4.1% more bytes on every row (sweep 20/20).  The
+wall ladder measured this session: chain-2 49.4 ms -> chain-1 33.7 ms (shipped)
+-> snappy-style skip no gain -> prefetch a loss on this VM -> u16 relative
+chain links +20%.  Every acceleration that reaches snappy's wall also reaches
+its ratio and loses the sweep (measured three times).  G0D-sprint is the
+fastest compressor that compresses *better than snappy on every row*.
+Roundtrips: 200/200 in `tests/benchall.sh`, goldcheck 20/20, scorecheck
+14W/6L, `native/test.cpp` all passed.
 
 Across its tiers G0D wins every dimension: default tier = **smallest of all
 compressors tested** (33.94%), sprint tier = **smaller than snappy on every
-row** while beating everything else in wall too.
+row** (1,758,204 = +4.1% better) while beating everything else in wall too.
 
 ## Speed: the tier system (reality-bend pass)
 
