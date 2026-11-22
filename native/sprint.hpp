@@ -24,13 +24,27 @@
 //   must match the block header exactly.
 #pragma once
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <vector>
 
 namespace szip {
 namespace sprint {
+
+#ifdef SP_PROFILE
+struct SpProf {
+  double hash = 0, chain = 0, interior = 0, emit = 0;
+  long probes = 0, hits = 0, matchbytes = 0, positions = 0;
+};
+static SpProf g_sp;
+#define SPT(x) x
+#else
+#define SPT(x)
+#endif
 
 static inline uint32_t load32(const uint8_t *p) {
   uint32_t v;
@@ -80,42 +94,52 @@ inline void compress(const uint8_t *src, uint32_t n, std::vector<uint8_t> &out) 
   std::vector<uint32_t> tbl(1u << bits, 0); // pos+1, 0 = empty
   std::unique_ptr<uint32_t[]> prev(new uint32_t[n + 1]); // written-before-read
 #ifndef SP_CHAIN
-#define SP_CHAIN 2
+#define SP_CHAIN 1
 #endif
   const uint32_t kChain = SP_CHAIN;
 
   const uint32_t kMinMatch = 4;
   uint32_t lit_start = 0;
   uint32_t pos = 0;
+  SPT(std::chrono::steady_clock::time_point tp0;)
 
   auto flush_lits = [&](uint32_t end) {
-    const uint32_t lit = end - lit_start;
-    if (!lit) return;
-    if (lit <= 60) {
-      out.push_back((uint8_t)((lit - 1) << 2));
-    } else {
-      out.push_back((uint8_t)(60 << 2));
-      put_ext(out, lit - 61);
+    uint32_t at = lit_start;
+    while (at < end) {
+      const uint32_t lit = std::min<uint32_t>(end - at, 65851u); // ext cap
+      if (lit <= 60) {
+        out.push_back((uint8_t)((lit - 1) << 2));
+      } else {
+        out.push_back((uint8_t)(60 << 2));
+        put_ext(out, lit - 61);
+      }
+      out.insert(out.end(), src + at, src + at + lit);
+      at += lit;
     }
-    out.insert(out.end(), src + lit_start, src + lit_start + lit);
     lit_start = end;
   };
 
   while (pos + kMinMatch <= n) {
+    SPT(tp0 = std::chrono::steady_clock::now());
     const uint32_t v = load32(src + pos);
     const uint32_t h = hash4(v, bits);
     prev[pos + 1] = tbl[h];
     tbl[h] = pos + 1;
+    SPT(g_sp.hash += std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count(); g_sp.positions++);
+    SPT(tp0 = std::chrono::steady_clock::now());
     uint32_t mlen = 0, moff = 0;
     int best_gain = -1;
     {
       uint32_t link = prev[pos + 1];
       for (uint32_t k = 0; k < kChain && link != 0; ++k) {
         const uint32_t cand = link - 1;
-        link = prev[link];
+        if (k + 1 < kChain) link = prev[link]; // no random read on the last probe
         if (cand >= pos || pos - cand > 65535u) continue;
+        SPT(g_sp.probes++);
         if (load32(src + cand) != v) continue;
-        const uint32_t len = extend(src, cand, pos, n - pos);
+        SPT(g_sp.hits++);
+        const uint32_t len =
+            4 + extend(src, cand + 4, pos + 4, n - pos - 4);
         const uint32_t off = pos - cand;
         const int gain =
             (int)len - (off > 2047 ? 3 : 2) - (len > 11 ? 1 : 0);
@@ -126,27 +150,43 @@ inline void compress(const uint8_t *src, uint32_t n, std::vector<uint8_t> &out) 
         }
       }
     }
+    SPT(g_sp.chain += std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count());
     if (mlen < kMinMatch) {
       ++pos;
       continue;
     }
+    SPT(g_sp.matchbytes += mlen);
+    SPT(tp0 = std::chrono::steady_clock::now());
     flush_lits(pos);
-    if (moff <= 2047 && mlen <= 11) {
-      out.push_back((uint8_t)(1 | (((mlen - 4) & 7) << 2) |
-                              (((moff >> 8) & 7) << 5)));
-      out.push_back((uint8_t)(moff & 255));
-    } else if (mlen <= 66) {
-      out.push_back((uint8_t)(2 | ((mlen - 4) << 2)));
-    } else {
+    uint32_t left = mlen;
+    while (left > 65857u) { // ext cap: chained copies, same offset
       out.push_back((uint8_t)(2 | (63 << 2)));
-      put_ext(out, mlen - 67);
-    }
-    if (moff > 2047 || mlen > 11) {
+      put_ext(out, 65857u - 67);
       out.push_back((uint8_t)(moff & 255));
       out.push_back((uint8_t)(moff >> 8));
+      left -= 65857u;
     }
+    {
+      const uint32_t m1 = left;
+      if (moff <= 2047 && m1 <= 11) {
+        out.push_back((uint8_t)(1 | (((m1 - 4) & 7) << 2) |
+                                (((moff >> 8) & 7) << 5)));
+        out.push_back((uint8_t)(moff & 255));
+      } else if (m1 <= 66) {
+        out.push_back((uint8_t)(2 | ((m1 - 4) << 2)));
+      } else {
+        out.push_back((uint8_t)(2 | (63 << 2)));
+        put_ext(out, m1 - 67);
+      }
+      if (moff > 2047 || m1 > 11) {
+        out.push_back((uint8_t)(moff & 255));
+        out.push_back((uint8_t)(moff >> 8));
+      }
+    }
+    SPT(g_sp.emit += std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count());
     // re-sync hash at the tail of the match (keeps chains warm)
     pos += mlen;
+    SPT(tp0 = std::chrono::steady_clock::now());
 #ifndef SP_NOINT
     {
       const uint32_t stop = pos > 2 ? pos - 2 : 0;
@@ -158,9 +198,20 @@ inline void compress(const uint8_t *src, uint32_t n, std::vector<uint8_t> &out) 
       }
     }
 #endif
+    SPT(g_sp.interior += std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count());
     lit_start = pos;
   }
+  SPT(tp0 = std::chrono::steady_clock::now());
   flush_lits(n);
+  SPT(g_sp.emit += std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count());
+#ifdef SP_PROFILE
+  std::fprintf(stderr,
+               "[sp] pos=%ld probes=%ld hits=%ld mbytes=%ld | hash=%.2fms chain=%.2fms interior=%.2fms emit=%.2fms\n",
+               g_sp.positions, g_sp.probes, g_sp.hits, g_sp.matchbytes,
+               g_sp.hash * 1e3, g_sp.chain * 1e3, g_sp.interior * 1e3,
+               g_sp.emit * 1e3);
+  g_sp = SpProf{};
+#endif
 }
 
 // Decompress one block.  Returns 0 on success, nonzero on corrupt input.
@@ -208,7 +259,13 @@ inline int decompress(const uint8_t *src, uint32_t src_n, uint8_t *dst,
       uint32_t mlen = ((tok >> 2) & 7) + 4;
       if ((size_t)(oend - out) < mlen) return 6;
       const uint8_t *m = out - off;
-      for (uint32_t i = 0; i < mlen; ++i) out[i] = m[i];
+      if (off >= 8) {
+        uint32_t i = 0;
+        for (; i + 8 <= mlen; i += 8) std::memcpy(out + i, m + i, 8);
+        for (; i < mlen; ++i) out[i] = m[i];
+      } else {
+        for (uint32_t i = 0; i < mlen; ++i) out[i] = m[i];
+      }
       out += mlen;
     } else if (tag == 2) {
       uint32_t mlen;
@@ -226,7 +283,13 @@ inline int decompress(const uint8_t *src, uint32_t src_n, uint8_t *dst,
       if (off == 0 || off > (size_t)(out - dst)) return 9;
       if ((size_t)(oend - out) < mlen) return 10;
       const uint8_t *m = out - off;
-      for (uint32_t i = 0; i < mlen; ++i) out[i] = m[i];
+      if (off >= 8) {
+        uint32_t i = 0;
+        for (; i + 8 <= mlen; i += 8) std::memcpy(out + i, m + i, 8);
+        for (; i < mlen; ++i) out[i] = m[i];
+      } else {
+        for (uint32_t i = 0; i < mlen; ++i) out[i] = m[i];
+      }
       out += mlen;
     } else {
       return 11; // reserved tag
