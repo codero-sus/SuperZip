@@ -1116,41 +1116,29 @@ static void encode_szlzrc_core(const uint8_t *src, uint32_t n,
   SZ_TIC(tbw);
   std::thread bwt_thread([&] {
     static const uint32_t kDeltas[4] = {1, 2, 4, 8};
-    // Gap-entropy proxy picks the one delta worth encoding alongside raw
-    // (measured: only pcm ever wins via delta, and its d=2 gap entropy is
-    // far below the rest).  Two BWT encodes instead of five.
-    uint32_t pick = 0;
-    {
-      double best_h = -1.0;
-      for (uint32_t di = 0; di < 4; ++di) {
-        const uint32_t dlt = kDeltas[di];
-        uint32_t cnt[256] = {0};
-        for (uint32_t i = dlt; i < n; ++i) {
-          const uint8_t v = (uint8_t)(src[i] - src[i - dlt]);
-          ++cnt[v];
-        }
-        double h = 0;
-        for (uint32_t c : cnt)
-          if (c) h += (double)c * -__builtin_log2((double)c / (double)(n - dlt ? n - dlt : 1));
-        if (best_h < 0 || h < best_h) { best_h = h; pick = di; }
-      }
-    }
-    std::vector<std::vector<uint8_t>> pay(2);
-    std::vector<uint8_t> dtmp;
+    // All five BWT candidates (raw + every delta); the delta that wins is
+    // not predictable from gap entropy across data types (d=1 on smooth
+    // records, d=2 on pcm, d=8 on aligned words), so take the true min.
+    std::vector<std::vector<uint8_t>> pay(5);
     std::vector<std::thread> ths;
     ths.emplace_back([&] { bwt::encode_block(src, n, pay[0]); });
-    ths.emplace_back([&, pick] {
-      const uint32_t dlt = kDeltas[pick];
-      dtmp.resize(n);
-      for (uint32_t i = 0; i < n; ++i)
-        dtmp[i] = (uint8_t)(src[i] - (i >= dlt ? src[i - dlt] : 0));
-      bwt::encode_block(dtmp.data(), n, pay[1]);
-    });
+    for (uint32_t di = 0; di < 4; ++di) {
+      ths.emplace_back([&, di] {
+        const uint32_t dlt = kDeltas[di];
+        std::vector<uint8_t> dtmp(n);
+        for (uint32_t i = 0; i < n; ++i)
+          dtmp[i] = (uint8_t)(src[i] - (i >= dlt ? src[i - dlt] : 0));
+        bwt::encode_block(dtmp.data(), n, pay[di + 1]);
+      });
+      if (ths.size() >= 2) { for (auto &t : ths) t.join(); ths.clear(); }
+    }
     for (auto &t : ths) t.join();
     best_bwt.swap(pay[0]);
-    if (pay[1].size() < best_bwt.size()) {
-      best_bwt.swap(pay[1]);
-      best_delta = pick + 1;
+    for (uint32_t di = 0; di < 4; ++di) {
+      if (pay[di + 1].size() < best_bwt.size()) {
+        best_bwt.swap(pay[di + 1]);
+        best_delta = di + 1;
+      }
     }
   });
   std::vector<uint8_t> cand[4];
