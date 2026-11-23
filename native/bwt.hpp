@@ -8,8 +8,6 @@
 
 #include <cstdint>
 #include <cstring>
-#include <cstdio>
-#include <cstdlib>
 #include <vector>
 
 #include "mix.hpp"
@@ -357,9 +355,6 @@ inline void encode_block(const uint8_t *src, uint32_t n,
   uint32_t best = 0;
   for (uint32_t k = 1; k < 5; ++k)
     if (c[k].size() < c[best].size()) best = k;
-  if (std::getenv("SZIP_BWTSTATS"))
-    std::fprintf(stderr, "[bwt] raw=%zu mtf=%zu rawgap=%zu mtfgap=%zu rle4=%zu best=%u\n",
-                 c[0].size(), c[1].size(), c[2].size(), c[3].size(), c[4].size(), best);
 
   out.push_back((uint8_t)(primary & 0xFF));
   out.push_back((uint8_t)((primary >> 8) & 0xFF));
