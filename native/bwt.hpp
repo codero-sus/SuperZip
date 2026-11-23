@@ -8,6 +8,8 @@
 
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include "mix.hpp"
@@ -244,6 +246,93 @@ static int coder3_decode(const uint8_t *in, uint32_t in_len,
   return 0;
 }
 
+// ------------------------------------------------------------- coder 4 --
+// MTF ranks with zero-run Elias-gamma coding (the bzip2 RUNA/RUNB insight:
+// MTF streams are long rank-0 runs; gamma(run) beats coding each zero).
+// Items: (z = #zeros, v = next nonzero rank); stream ends when n symbols
+// are reconstructed.  Adaptive binary probs keyed by (prev rank, run band).
+struct Rle4Model {
+  Prob uz[4][22], bz[4][22], uv[16][22], bv[16][22];
+  Rle4Model() {
+    for (auto &r : uz) for (auto &p : r) p = (Prob)kProbInit;
+    for (auto &r : bz) for (auto &p : r) p = (Prob)kProbInit;
+    for (auto &r : uv) for (auto &p : r) p = (Prob)kProbInit;
+    for (auto &r : bv) for (auto &p : r) p = (Prob)kProbInit;
+  }
+};
+
+static void rle4_gamma_enc(RcEncoder &rc, Prob *un, Prob *bn, uint32_t x) {
+  uint32_t nn = 0;
+  while ((2u << nn) <= x) ++nn;
+  for (uint32_t i = 0; i < nn; ++i) rc.encode_bit(un[i], 1);
+  rc.encode_bit(un[nn], 0);
+  for (uint32_t i = nn; i-- > 0;) rc.encode_bit(bn[i], (x >> i) & 1u);
+}
+
+static int rle4_gamma_dec(RcDecoder &rc, Prob *un, Prob *bn, uint32_t *out) {
+  uint32_t nn = 0;
+  while (rc.decode_bit(un[nn]) == 1) {
+    ++nn;
+    if (nn > 21) return -1;
+  }
+  uint32_t x = 1;
+  for (uint32_t i = nn; i-- > 0;) x = (x << 1) | rc.decode_bit(bn[i]);
+  *out = x;
+  return 0;
+}
+
+static void coder4_encode(const std::vector<uint8_t> &bw,
+                          std::vector<uint8_t> &out) {
+  std::vector<uint8_t> ranks;
+  mtf_forward(bw, ranks);
+  Rle4Model m;
+  RcEncoder rc(out);
+  uint32_t prev_v = 0;
+  size_t i = 0;
+  const size_t n = ranks.size();
+  while (i < n) {
+    uint32_t z = 0;
+    while (i < n && ranks[i] == 0) { ++z; ++i; }
+    const uint32_t cz = prev_v < 3 ? prev_v : 3;
+    rle4_gamma_enc(rc, m.uz[cz], m.bz[cz], z + 1);
+    if (i < n) {
+      const uint32_t v = ranks[i++];
+      const uint32_t cv = (z < 3 ? z : 3) + 4 * cz;
+      rle4_gamma_enc(rc, m.uv[cv], m.bv[cv], v);
+      prev_v = v;
+    }
+  }
+  rc.flush();
+}
+
+static int coder4_decode(const uint8_t *in, uint32_t in_len,
+                         std::vector<uint8_t> &bw, uint32_t n) {
+  Rle4Model m;
+  RcDecoder rc(in, in_len);
+  if (!rc.init()) return -1;
+  std::vector<uint8_t> ranks(n);
+  uint32_t out = 0, prev_v = 0;
+  while (out < n) {
+    const uint32_t cz = prev_v < 3 ? prev_v : 3;
+    uint32_t z1 = 0;
+    if (rle4_gamma_dec(rc, m.uz[cz], m.bz[cz], &z1)) return -1;
+    const uint32_t z = z1 - 1;
+    if (z > n - out) return -1;
+    for (uint32_t k = 0; k < z; ++k) ranks[out++] = 0;
+    if (out < n) {
+      const uint32_t cv = (z < 3 ? z : 3) + 4 * cz;
+      uint32_t v = 0;
+      if (rle4_gamma_dec(rc, m.uv[cv], m.bv[cv], &v)) return -1;
+      if (v == 0 || v > 255) return -1;
+      ranks[out++] = (uint8_t)v;
+      prev_v = v;
+    }
+  }
+  if (!rc.ok()) return -1;
+  mtf_inverse(ranks, bw);
+  return 0;
+}
+
 // --------------------------------------------------------- block payload --
 // payload = [u32 LE primary][u8 coder_id][RC stream]
 inline void encode_block(const uint8_t *src, uint32_t n,
@@ -259,14 +348,18 @@ inline void encode_block(const uint8_t *src, uint32_t n,
   uint32_t primary = 0;
   bwt_forward(src, n, bw, &primary);
 
-  std::vector<uint8_t> c[4];
+  std::vector<uint8_t> c[5];
   coder0_encode(bw, c[0]);
   coder1_encode(bw, c[1]);
   coder2_encode(bw, c[2]);
   coder3_encode(bw, c[3]);
+  coder4_encode(bw, c[4]);
   uint32_t best = 0;
-  for (uint32_t k = 1; k < 4; ++k)
+  for (uint32_t k = 1; k < 5; ++k)
     if (c[k].size() < c[best].size()) best = k;
+  if (std::getenv("SZIP_BWTSTATS"))
+    std::fprintf(stderr, "[bwt] raw=%zu mtf=%zu rawgap=%zu mtfgap=%zu rle4=%zu best=%u\n",
+                 c[0].size(), c[1].size(), c[2].size(), c[3].size(), c[4].size(), best);
 
   out.push_back((uint8_t)(primary & 0xFF));
   out.push_back((uint8_t)((primary >> 8) & 0xFF));
@@ -295,6 +388,7 @@ inline int decode_block(const uint8_t *src, uint32_t src_len, uint8_t *dst,
   case 1: e = coder1_decode(src + 5, src_len - 5, bw, n); break;
   case 2: e = coder2_decode(src + 5, src_len - 5, bw, n); break;
   case 3: e = coder3_decode(src + 5, src_len - 5, bw, n); break;
+  case 4: e = coder4_decode(src + 5, src_len - 5, bw, n); break;
   default: return -1;
   }
   if (e) return e;

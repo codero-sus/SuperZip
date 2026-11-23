@@ -14,7 +14,7 @@ all: $(BUILD)/g0dszip
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(BUILD)/g0dszip: $(NATIVE) native/szip.h native/rc.hpp native/crc32.hpp native/lz77.hpp native/mix.hpp native/tables.hpp | $(BUILD)
+$(BUILD)/g0dszip: $(NATIVE) native/szip.h native/rc.hpp native/crc32.hpp native/lz77.hpp native/mix.hpp native/tables.hpp native/bwt.hpp native/sprint.hpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) -Inative $(NATIVE) -o $@ -pthread $(LDLIBS)
 
 $(BUILD)/test_szip: $(TESTS) native/codec.cpp native/szip.h native/rc.hpp native/crc32.hpp native/lz77.hpp native/mix.hpp native/tables.hpp | $(BUILD)

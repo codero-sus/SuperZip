@@ -396,6 +396,7 @@ Entropy coders over `bw` (each an ordinary `RcEncoder` stream):
 | 1 | MTF ranks of `bw` through the mixer (word-shape mode) |
 | 2 | raw `bw` columns, mixer gap mode |
 | 3 | MTF ranks, mixer gap mode |
+| 4 | MTF ranks + zero-run Elias-gamma (RUNA/RUNB-style runs of rank 0) |
 
 Decoders invert MTF (if used) and then `bw` via the standard last/first
 walk from `primary`, finally applying the byte-delta inverse if the mode

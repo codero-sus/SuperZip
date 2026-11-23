@@ -11,10 +11,7 @@ Exit 0 only if every check passes.
 """
 import subprocess, sys, os
 
-GOLD = {"prose":26276,"dict":24434,"text":52936,"code":17025,"xml":13942,"json":10708,
-        "log":8621,"html":11942,"csv":29834,"utf8":14795,"b64":24394,"hex":34030,
-        "dna":19011,"src":51606,"floats":87341,"pcm":101968,"binary":63521,
-        "sparse":776,"mixed":51010,"rand":500004}
+GOLD = {"prose":26276,"dict":24421,"text":52539,"code":17025,"xml":13722,"json":10708,"log":8457,"html":11752,"csv":29834,"utf8":14768,"b64":24394,"hex":34030,"dna":19011,"src":51606,"floats":87341,"pcm":101968,"binary":63521,"sparse":776,"mixed":51010,"rand":500004}
 ROWS = [("prose","build/corpus20/prose.bin"),("dict","build/corpus20/dict.bin"),
         ("text","build/corpus_text.bin"),("code","build/corpus_code.bin"),
         ("xml","build/corpus20/xml.bin"),("json","build/corpus20/json.bin"),

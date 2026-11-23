@@ -1223,7 +1223,8 @@ static void encode_szlzrc_core(const uint8_t *src, uint32_t n,
     for (uint32_t k = 0; k < 4; ++k)
       if ((g_modeset & (1 << k)) && (best == UINT32_MAX || cand[k].size() < cand[best].size())) best = k;
   }
-  if (best_bwt.size() < cand[best].size()) {
+  if (best_bwt.size() < cand[best].size() ||
+      std::getenv("SZIP_FORCEBWT")) {
     out.push_back((uint8_t)((best_delta << 3) | 4u));
     out.insert(out.end(), best_bwt.begin(), best_bwt.end());
     return;
